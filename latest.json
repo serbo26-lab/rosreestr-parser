@@ -5,7 +5,7 @@
   "file_name": "rosreestr_parser.zip",
   "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v1/rosreestr_parser.zip",
   "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1",
-  "sha256": "",
+  "sha256": "6c39efd5af5ef500e4f3938c5a8d49cfcdd8866c9789e979da991b4054b7c4bd",
   "notes": [
     "Первый публичный portable EXE-релиз.",
     "Запуск без установки Python: распаковать архив и открыть RosreestrParser.exe.",
