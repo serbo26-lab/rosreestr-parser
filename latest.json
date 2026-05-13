@@ -5,7 +5,7 @@
   "file_name": "rosreestr_parser.zip",
   "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v56/rosreestr_parser.zip",
   "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v56",
-  "sha256": "46424a957ec42936ea6a7d6f2d42dba7dc170175ca09321303cf5600717a0b4b",
+  "sha256": "029465b619ec9c90e667b1df7ec374613a31b5fbaf190b14aa650136098394b3",
   "notes": [
     "Настроена проверка обновлений через публичный GitHub",
     "Имя ZIP-архива обновления фиксированное: rosreestr_parser.zip",
