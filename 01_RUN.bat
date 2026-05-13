@@ -2,6 +2,12 @@
 setlocal
 cd /d "%~dp0"
 
+if not exist "config.json" (
+  if exist "config.example.json" (
+    copy /Y "config.example.json" "config.json" >nul
+  )
+)
+
 if not exist ".venv\Scripts\python.exe" (
   echo Virtual environment not found. Running automatic setup first...
   call "00_SETUP.bat"

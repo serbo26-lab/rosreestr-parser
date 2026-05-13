@@ -37,7 +37,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
-APP_TITLE = "Парсер Росреестра — v1"
+APP_TITLE = "Парсер Росреестра — V1"
 APP_VERSION_CODE = 1
 
 REQUIRED_HEADERS = [
@@ -1087,7 +1087,7 @@ def read_manual_units_from_file(path_value: Any) -> list[str]:
         try:
             from docx import Document
         except Exception as e:
-            raise RuntimeError("Для чтения .docx нужен пакет python-docx. Запустите 00_SETUP.bat после обновления.") from e
+            raise RuntimeError("Для чтения .docx нужен пакет python-docx. Для source-версии запустите 00_SETUP.bat; для EXE-версии скачайте свежий rosreestr_parser.zip из Releases.") from e
         doc = Document(str(path))
         for table in doc.tables:
             for row in table.rows:
@@ -2201,7 +2201,7 @@ def read_text_docx(path: Path) -> list[list[str]]:
     try:
         from docx import Document
     except Exception as e:
-        raise RuntimeError("Для чтения .docx нужен пакет python-docx. Запустите 00_SETUP.bat после обновления.") from e
+        raise RuntimeError("Для чтения .docx нужен пакет python-docx. Для source-версии запустите 00_SETUP.bat; для EXE-версии скачайте свежий rosreestr_parser.zip из Releases.") from e
     doc = Document(str(path))
     rows: list[list[str]] = []
     for table in doc.tables:
@@ -2373,7 +2373,7 @@ def read_xls_rows(path: Path) -> list[tuple[str, list[list[Any]]]]:
     try:
         import xlrd
     except Exception as e:
-        raise RuntimeError("Для чтения .xls нужен пакет xlrd. Запустите 00_SETUP.bat после обновления.") from e
+        raise RuntimeError("Для чтения .xls нужен пакет xlrd. Для source-версии запустите 00_SETUP.bat; для EXE-версии скачайте свежий rosreestr_parser.zip из Releases.") from e
 
     book = xlrd.open_workbook(str(path))
     result: list[tuple[str, list[list[Any]]]] = []

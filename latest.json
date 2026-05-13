@@ -1,5 +1,5 @@
 {
-  "latest_version": "v1",
+  "latest_version": "V1",
   "version_code": 1,
   "channel": "stable",
   "file_name": "rosreestr_parser.zip",
@@ -7,8 +7,8 @@
   "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1",
   "sha256": "",
   "notes": [
-    "Настроена проверка обновлений через публичный GitHub",
-    "Имя ZIP-архива обновления фиксированное: rosreestr_parser.zip",
-    "Добавлена кнопка скачивания ZIP обновления"
+    "Первый публичный portable EXE-релиз.",
+    "Запуск без установки Python: распаковать архив и открыть RosreestrParser.exe.",
+    "BAT-файлы оставлены только для запуска из исходников."
   ]
 }
