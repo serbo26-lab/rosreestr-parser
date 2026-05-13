@@ -37,8 +37,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
-APP_TITLE = "Парсер Росреестра — V56"
-APP_VERSION_CODE = 56
+APP_TITLE = "Парсер Росреестра — v1"
+APP_VERSION_CODE = 1
 
 REQUIRED_HEADERS = [
     "Номер помещения (обяз.)",
