@@ -5,7 +5,7 @@
   "file_name": "rosreestr_parser.zip",
   "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v1.1/rosreestr_parser.zip",
   "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1.1",
-  "sha256": "",
+  "sha256": "c2a081b93d6b8cc6c5f658464153a2bfc160bd47b7aecbf7194945127507fd49",
   "notes": [
     "Добавлена безопасная автоустановка обновлений из программы.",
     "Пользовательские настройки и данные не перезаписываются: config.json, output, state, profiles, profile_rosreestr, updates.",
