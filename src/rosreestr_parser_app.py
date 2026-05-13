@@ -26,6 +26,9 @@ import traceback
 import hashlib
 import webbrowser
 import urllib.request
+import shutil
+import subprocess
+import zipfile
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,8 +40,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
-APP_TITLE = "Парсер Росреестра — V1"
-APP_VERSION_CODE = 1
+APP_TITLE = "Парсер Росреестра — V1.1"
+APP_VERSION_CODE = 11
 
 REQUIRED_HEADERS = [
     "Номер помещения (обяз.)",
@@ -6421,57 +6424,230 @@ class App(tk.Tk):
         repo_url = str(self.cfg.get("repository_url") or "").strip()
         manifest_url = str(self.cfg.get("update_manifest_url") or "").strip()
 
-        ttk.Label(update_frame, text=f"Текущая версия: {APP_TITLE}").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(update_frame, text=f"Текущая версия: {APP_TITLE}").grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
         self.update_status_var = tk.StringVar(value=(
             "Проверка обновлений будет доступна после указания repository_url и update_manifest_url в config.json."
             if not manifest_url else "Нажмите «Проверить обновление»."
         ))
-        ttk.Label(update_frame, textvariable=self.update_status_var, wraplength=900).grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        ttk.Label(update_frame, textvariable=self.update_status_var, wraplength=900).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(0, 8))
 
         ttk.Button(update_frame, text="Проверить обновление", command=self.check_update).grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Button(update_frame, text="Скачать ZIP обновления", command=self.download_update_zip).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=3)
+        ttk.Button(update_frame, text="Скачать и установить обновление", command=self.download_and_install_update).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=3)
         ttk.Button(update_frame, text="Открыть репозиторий", command=self.open_repository_url).grid(row=2, column=2, sticky="w", padx=(0, 8), pady=3)
         ttk.Button(update_frame, text="Открыть страницу релиза", command=self.open_release_url).grid(row=2, column=3, sticky="w", padx=(0, 8), pady=3)
         ttk.Button(update_frame, text="Открыть config.json", command=self.open_config_file).grid(row=2, column=4, sticky="w", pady=3)
 
         repo_text = repo_url or "не задано"
         manifest_text = manifest_url or "не задано"
-        ttk.Label(update_frame, text=f"Репозиторий: {repo_text}", wraplength=900).grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 2))
-        ttk.Label(update_frame, text=f"Manifest обновлений: {manifest_text}", wraplength=900).grid(row=4, column=0, columnspan=4, sticky="ew", pady=2)
+        ttk.Label(update_frame, text=f"Репозиторий: {repo_text}", wraplength=900).grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 2))
+        ttk.Label(update_frame, text=f"Manifest обновлений: {manifest_text}", wraplength=900).grid(row=4, column=0, columnspan=5, sticky="ew", pady=2)
         update_frame.columnconfigure(3, weight=1)
 
         self.last_update_info: dict[str, Any] = {}
 
-    def download_update_zip(self) -> None:
-        info = getattr(self, "last_update_info", {}) or {}
+    def _download_update_archive(self, info: dict[str, Any]) -> tuple[Path, str]:
         download_url = str(info.get("download_url") or "").strip()
         if not download_url:
-            self.update_status_var.set("Сначала нажмите «Проверить обновление». В manifest должен быть download_url.")
-            return
+            raise RuntimeError("В manifest нет download_url. Сначала нажмите «Проверить обновление».")
         file_name = str(info.get("file_name") or "rosreestr_parser.zip").strip() or "rosreestr_parser.zip"
         expected_sha = str(info.get("sha256") or "").strip().lower()
+
+        updates_dir = self.base_dir / "updates"
+        updates_dir.mkdir(parents=True, exist_ok=True)
+        dst = updates_dir / file_name
+
+        self.update_status_var.set("Скачиваю обновление...")
+        self.update_idletasks()
+        with urllib.request.urlopen(download_url, timeout=90) as resp:
+            data = resp.read()
+
+        actual_sha = hashlib.sha256(data).hexdigest().lower()
+        if expected_sha and actual_sha != expected_sha:
+            raise RuntimeError(
+                "SHA256 скачанного архива не совпал. Файл не сохранён.\n"
+                f"Ожидалось: {expected_sha}\nПолучено: {actual_sha}"
+            )
+
+        dst.write_bytes(data)
+        return dst, actual_sha
+
+    def download_update_zip(self) -> None:
+        """Ручное скачивание ZIP без установки. Оставлено как безопасный fallback."""
+        info = getattr(self, "last_update_info", {}) or {}
         try:
-            updates_dir = self.base_dir / "updates"
-            updates_dir.mkdir(parents=True, exist_ok=True)
-            dst = updates_dir / file_name
-            self.update_status_var.set("Скачиваю обновление...")
-            self.update_idletasks()
-            with urllib.request.urlopen(download_url, timeout=60) as resp:
-                data = resp.read()
-            actual_sha = hashlib.sha256(data).hexdigest()
-            if expected_sha and actual_sha.lower() != expected_sha:
-                self.update_status_var.set(
-                    "Обновление скачано, но SHA256 не совпал. Файл не сохранён.\n"
-                    f"Ожидалось: {expected_sha}\nПолучено: {actual_sha}"
-                )
-                return
-            dst.write_bytes(data)
+            dst, actual_sha = self._download_update_archive(info)
             self.update_status_var.set(
                 f"ZIP обновления скачан:\n{dst}\n\n"
-                "Автоустановка пока не выполняется: распакуйте архив вручную или используйте страницу релиза."
+                f"SHA256: {actual_sha}\n\n"
+                "Можно распаковать архив вручную или использовать кнопку «Скачать и установить обновление»."
             )
         except Exception as e:
             self.update_status_var.set(f"Не удалось скачать обновление: {e}")
+
+    def _safe_extract_zip(self, zip_path: Path, target_dir: Path) -> None:
+        """Распаковка ZIP с защитой от путей вида ../."""
+        target_dir.mkdir(parents=True, exist_ok=True)
+        base = target_dir.resolve()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in zf.infolist():
+                name = member.filename.replace("\\", "/")
+                if not name or name.startswith("/") or ".." in Path(name).parts:
+                    raise RuntimeError(f"Небезопасный путь в архиве обновления: {member.filename}")
+                dest = (target_dir / name).resolve()
+                if base not in dest.parents and dest != base:
+                    raise RuntimeError(f"Небезопасный путь в архиве обновления: {member.filename}")
+            zf.extractall(target_dir)
+
+    def _find_update_root(self, extract_dir: Path) -> Path:
+        """Поддерживает ZIP как с файлами в корне, так и с одной вложенной папкой."""
+        if (extract_dir / "RosreestrParser.exe").exists():
+            return extract_dir
+        for child in extract_dir.iterdir():
+            if child.is_dir() and (child / "RosreestrParser.exe").exists():
+                return child
+        raise RuntimeError("В архиве обновления не найден RosreestrParser.exe")
+
+    def _validate_update_root(self, root: Path) -> None:
+        required = [
+            "RosreestrParser.exe",
+            "docs/wiki_oss.md",
+            "docs/wiki_snt.md",
+            "template_burmistr.xlsx",
+            "template_roskvartal.xlsx",
+            "template_snt.xlsx",
+        ]
+        missing = [x for x in required if not (root / x).exists()]
+        if missing:
+            raise RuntimeError("Архив обновления неполный. Не найдены файлы:\n" + "\n".join(missing))
+
+    def _write_update_apply_bat(self, source_dir: Path, latest_version: str) -> Path:
+        """Создаёт BAT, который применит обновление после закрытия EXE."""
+        safe_version = re.sub(r"[^0-9A-Za-zА-Яа-я_.-]+", "_", str(latest_version or "update")).strip("_.-") or "update"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        updates_dir = self.base_dir / "updates"
+        backups_dir = updates_dir / "backups"
+        backup_dir = backups_dir / f"backup_before_{safe_version}_{stamp}"
+        bat_path = updates_dir / "update_apply.bat"
+        app_dir = self.base_dir.resolve()
+        src_dir = source_dir.resolve()
+        exe_path = app_dir / "RosreestrParser.exe"
+
+        bat_lines = [
+            '@echo off',
+            'setlocal EnableExtensions',
+            'chcp 65001 >nul',
+            f'set "APP_DIR={app_dir}"',
+            f'set "SRC_DIR={src_dir}"',
+            f'set "BACKUP_DIR={backup_dir}"',
+            f'set "EXE_PATH={exe_path}"',
+            '',
+            'echo Rosreestr Parser update',
+            'echo.',
+            'echo Waiting for the program to close...',
+            'timeout /t 3 /nobreak >nul',
+            '',
+            r'if not exist "%SRC_DIR%\RosreestrParser.exe" goto FAIL',
+            r'if not exist "%BACKUP_DIR%" mkdir "%BACKUP_DIR%" >nul 2>nul',
+            '',
+            'echo Creating backup...',
+            r'robocopy "%APP_DIR%" "%BACKUP_DIR%" /E /XD "%APP_DIR%\output" "%APP_DIR%\state" "%APP_DIR%\profiles" "%APP_DIR%\profile_rosreestr" "%APP_DIR%\updates" /XF "config.json" /R:2 /W:1 >nul',
+            'if %ERRORLEVEL% GEQ 8 goto FAIL',
+            '',
+            'echo Installing update...',
+            r'robocopy "%SRC_DIR%" "%APP_DIR%" /E /XD "%SRC_DIR%\output" "%SRC_DIR%\state" "%SRC_DIR%\profiles" "%SRC_DIR%\profile_rosreestr" "%SRC_DIR%\updates" /XF "config.json" /R:5 /W:2',
+            'if %ERRORLEVEL% GEQ 8 goto FAIL',
+            '',
+            r'if not exist "%EXE_PATH%" goto FAIL',
+            '',
+            'echo Starting updated program...',
+            r'start "" "%EXE_PATH%"',
+            'exit /b 0',
+            '',
+            ':FAIL',
+            'echo.',
+            'echo Update failed.',
+            'echo Backup folder:',
+            'echo %BACKUP_DIR%',
+            'echo.',
+            'echo User files were not intentionally modified: config.json, output, state, profiles, profile_rosreestr, updates.',
+            'pause',
+            'exit /b 1',
+        ]
+        bat_path.write_text("\n".join(bat_lines) + "\n", encoding="utf-8")
+        return bat_path
+
+    def download_and_install_update(self) -> None:
+        info = getattr(self, "last_update_info", {}) or {}
+        if not info:
+            self.update_status_var.set("Сначала нажмите «Проверить обновление».")
+            return
+
+        latest_version = str(info.get("latest_version") or info.get("version") or "обновление").strip()
+        try:
+            latest_code = int(info.get("version_code") or self._version_code_from_text(latest_version))
+            current_code = int(globals().get("APP_VERSION_CODE", self._version_code_from_text(APP_TITLE)))
+        except Exception:
+            latest_code = 0
+            current_code = 0
+        if latest_code and current_code and latest_code <= current_code:
+            self.update_status_var.set(f"Обновлений нет. Установлена актуальная версия: {APP_TITLE}.")
+            return
+
+        worker = getattr(self, "worker", None)
+        if worker and worker.is_alive():
+            messagebox.showwarning(APP_TITLE, "Перед установкой обновления остановите текущую задачу парсинга.")
+            return
+
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                APP_TITLE,
+                "Автоустановка предназначена для portable EXE-версии.\n\n"
+                "При запуске из исходников можно скачать ZIP вручную или собрать новую версию через 02_BUILD_EXE.bat.",
+            )
+            self.download_update_zip()
+            return
+
+        ok = messagebox.askyesno(
+            APP_TITLE,
+            "Скачать и установить обновление?\n\n"
+            f"Текущая версия: {APP_TITLE}\n"
+            f"Новая версия: {latest_version or latest_code}\n\n"
+            "Программа будет закрыта, файлы программы будут обновлены, затем новая версия запустится автоматически.\n\n"
+            "Не будут перезаписаны: config.json, output, state, profiles, profile_rosreestr, updates.",
+        )
+        if not ok:
+            return
+
+        try:
+            zip_path, actual_sha = self._download_update_archive(info)
+
+            install_base = self.base_dir / "updates" / "install_tmp"
+            if install_base.exists():
+                shutil.rmtree(install_base, ignore_errors=True)
+            install_base.mkdir(parents=True, exist_ok=True)
+
+            self.update_status_var.set("Распаковываю обновление...")
+            self.update_idletasks()
+            extract_dir = install_base / "extracted"
+            self._safe_extract_zip(zip_path, extract_dir)
+            update_root = self._find_update_root(extract_dir)
+            self._validate_update_root(update_root)
+
+            bat_path = self._write_update_apply_bat(update_root, latest_version)
+            self.update_status_var.set(
+                f"Обновление скачано и проверено.\nZIP: {zip_path}\nSHA256: {actual_sha}\n\n"
+                "Сейчас программа закроется, применит обновление и запустится снова."
+            )
+            self.update_idletasks()
+
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["cmd", "/c", "start", "", str(bat_path)], cwd=str(self.base_dir), close_fds=True)
+            else:
+                subprocess.Popen([str(bat_path)], cwd=str(self.base_dir), close_fds=True)
+            self.after(500, self.destroy)
+        except Exception as e:
+            self.update_status_var.set(f"Не удалось установить обновление: {e}")
+            messagebox.showerror(APP_TITLE, f"Не удалось установить обновление:\n\n{e}")
 
     def open_url_safe(self, url: str, empty_message: str = "Ссылка не задана.") -> None:
         url = str(url or "").strip()
@@ -6541,7 +6717,7 @@ class App(tk.Tk):
                     msg += "\n\nЧто изменилось:\n" + notes_text
                 download_url = str(data.get("download_url") or "").strip()
                 if download_url:
-                    msg += "\n\nМожно открыть страницу релиза или ссылку скачивания кнопкой «Открыть страницу релиза»."
+                    msg += "\n\nМожно нажать «Скачать и установить обновление» или открыть страницу релиза вручную."
                 self.update_status_var.set(msg)
             else:
                 self.update_status_var.set(f"Обновлений нет. Установлена актуальная версия: {APP_TITLE}.")
