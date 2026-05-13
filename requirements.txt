@@ -1,0 +1,6 @@
+playwright
+openpyxl
+pyinstaller
+
+python-docx
+xlrd>=2.0.1
