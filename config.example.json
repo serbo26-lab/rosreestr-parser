@@ -58,7 +58,7 @@
   "snt_append_existing": true,
   "oss_export_format": "burmistr",
   "match_oss_export_format": "burmistr",
-  "snt_try_address_variants": true,
+  "snt_try_address_variants": false,
   "snt_write_buildings": true,
   "snt_update_old_registry_path": "",
   "snt_update_new_result_path": "",
@@ -70,5 +70,13 @@
   "snt_update_add_new_objects": true,
   "repository_url": "https://github.com/serbo26-lab/rosreestr-parser",
   "update_manifest_url": "https://raw.githubusercontent.com/serbo26-lab/rosreestr-parser/main/latest.json",
-  "update_channel": "stable"
+  "update_channel": "stable",
+  "snt_start_plot": 1,
+  "snt_end_plot": 100,
+  "snt_extra_unit_numbers": "",
+  "snt_manual_unit_numbers": "",
+  "snt_manual_unit_file_path": "",
+  "snt_output_path": "output/result.xlsx",
+  "snt_template_path": "template_snt.xlsx",
+  "full_info_template_path": "template_full_info.xlsx"
 }

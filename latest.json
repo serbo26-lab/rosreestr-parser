@@ -1,14 +1,18 @@
 {
-  "latest_version": "V1.1",
-  "version_code": 11,
+  "latest_version": "V1.2",
+  "version_code": 12,
   "channel": "stable",
   "file_name": "rosreestr_parser.zip",
-  "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v1.1/rosreestr_parser.zip",
-  "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1.1",
-  "sha256": "c2a081b93d6b8cc6c5f658464153a2bfc160bd47b7aecbf7194945127507fd49",
+  "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v1.2/rosreestr_parser.zip",
+  "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1.2",
+  "sha256": "e0e10433a316eb0bd491c51799846fb231effce67fea83b3cd27ebdcba59d0a0",
   "notes": [
-    "Добавлена безопасная автоустановка обновлений из программы.",
-    "Пользовательские настройки и данные не перезаписываются: config.json, output, state, profiles, profile_rosreestr, updates.",
-    "Перед заменой файлов программы создаётся backup в папке updates/backups."
+    "UX-релиз: добавлена вкладка Главная с основными сценариями работы.",
+    "Основные поля ОСС и СНТ оставлены на виду, расширенные и служебные настройки свернуты.",
+    "Единые пресеты скорости для ОСС и СНТ: Быстро, Обычно, Медленно.",
+    "Ручные настройки скорости убраны в раскрываемый блок.",
+    "Режим ОСС «Реестр всех сведений» переименован в «Полные сведения по объектам».",
+    "Формат Burmistr/Roskvartal показывается только для режима «Реестр для ОСС».",
+    "Расширенный поиск СНТ теперь выключен по умолчанию."
   ]
 }

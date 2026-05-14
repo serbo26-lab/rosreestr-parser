@@ -40,8 +40,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
-APP_TITLE = "Парсер Росреестра — V1.1"
-APP_VERSION_CODE = 11
+APP_TITLE = "Парсер Росреестра — V1.2"
+APP_VERSION_CODE = 12
 
 REQUIRED_HEADERS = [
     "Номер помещения (обяз.)",
@@ -210,12 +210,12 @@ OSS_EXPORT_FORMAT_LABELS = {v: k for k, v in OSS_EXPORT_FORMATS.items()}
 
 PARSER_MODES = {
     "Реестр для ОСС": "oss",
-    "Реестр всех сведений": "full",
+    "Полные сведения по объектам": "full",
     "Реестр кадастровых номеров": "cadastral",
-    "Реестр земельных участков / СНТ": "snt",
 }
 
 PARSER_MODE_LABELS = {v: k for k, v in PARSER_MODES.items()}
+PARSER_MODE_LABELS["snt"] = "СНТ / земли"
 
 DEFAULT_CONFIG = {
     "login_url": "https://lk.rosreestr.ru/login",
@@ -241,13 +241,21 @@ DEFAULT_CONFIG = {
     "snt_city": "",
     "snt_name": "",
     "snt_cadastral_quarters": "",
+    "snt_start_plot": 1,
+    "snt_end_plot": 100,
+    "snt_extra_unit_numbers": "",
+    "snt_manual_unit_numbers": "",
+    "snt_manual_unit_file_path": "",
+    "snt_output_path": "output/result.xlsx",
+    "snt_template_path": "template_snt.xlsx",
+    "full_info_template_path": "template_full_info.xlsx",
     "snt_include_actual": True,
     "snt_include_redeemed": True,
     "snt_only_land": False,
     "snt_write_buildings": True,
     "snt_write_not_found": True,
     "snt_append_existing": True,
-    "snt_try_address_variants": True,
+    "snt_try_address_variants": False,
     "pause_min_seconds": 3,
     "pause_max_seconds": 7,
     "retry_count": 3,
@@ -283,6 +291,14 @@ DEFAULT_CONFIG = {
     "update_manifest_url": "https://raw.githubusercontent.com/serbo26-lab/rosreestr-parser/main/latest.json",
     "update_channel": "stable",
 }
+
+
+SPEED_PRESETS = {
+    "Быстро": (1, 3),
+    "Обычно": (3, 7),
+    "Медленно": (6, 12),
+}
+SPEED_PRESET_VALUES = ["Быстро", "Обычно", "Медленно", "Пользовательский"]
 
 
 @dataclass
@@ -374,6 +390,52 @@ def save_config(config_path: Path, cfg: dict[str, Any]) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def sanitize_loaded_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Мягкая миграция старых config.json после разделения ОСС и СНТ.
+
+    В ранней V1.2 вкладка СНТ могла сохранить общий parser_mode=snt и
+    address_prefix="Город СНТ", из-за чего после перезапуска вкладка ОСС
+    открывалась в СНТ-режиме и с СНТ-адресом. Исправляем это при загрузке.
+    """
+    cfg = dict(cfg or {})
+
+    # Старые СНТ-поля могли храниться в общих start/end/manual/output.
+    # Если отдельных СНТ-полей ещё нет, переносим значения один раз, но
+    # не перетираем ОСС-поля дальше.
+    if "snt_start_plot" not in cfg:
+        cfg["snt_start_plot"] = cfg.get("start_flat", DEFAULT_CONFIG.get("snt_start_plot", 1))
+    if "snt_end_plot" not in cfg:
+        cfg["snt_end_plot"] = cfg.get("end_flat", DEFAULT_CONFIG.get("snt_end_plot", 100))
+    if "snt_extra_unit_numbers" not in cfg:
+        cfg["snt_extra_unit_numbers"] = cfg.get("extra_unit_numbers", "")
+    if "snt_manual_unit_numbers" not in cfg:
+        cfg["snt_manual_unit_numbers"] = cfg.get("manual_unit_numbers", "")
+    if "snt_manual_unit_file_path" not in cfg:
+        cfg["snt_manual_unit_file_path"] = cfg.get("manual_unit_file_path", "")
+    if "snt_output_path" not in cfg:
+        cfg["snt_output_path"] = cfg.get("output_path", DEFAULT_CONFIG.get("snt_output_path", "output/result.xlsx"))
+    if "snt_template_path" not in cfg:
+        cfg["snt_template_path"] = "template_snt.xlsx"
+    if "full_info_template_path" not in cfg:
+        cfg["full_info_template_path"] = "template_full_info.xlsx"
+
+    # Вкладка ОСС не должна открываться в режиме СНТ. СНТ запускается
+    # отдельной кнопкой и передаёт parser_mode=snt только worker'у.
+    if str(cfg.get("parser_mode") or "").strip() == "snt":
+        cfg["parser_mode"] = "oss"
+        cfg["collect_cadastral_only"] = False
+        city_name = f"{cfg.get('snt_city') or ''} {cfg.get('snt_name') or ''}".strip()
+        if city_name and normalize_text(cfg.get("address_prefix")) == normalize_text(city_name):
+            cfg["address_prefix"] = DEFAULT_CONFIG.get("address_prefix", "г Город ул Улица д 1 кв")
+
+    # Если после старого СНТ-сохранения общий шаблон стал СНТ-шаблоном,
+    # возвращаем для ОСС обычный Burmistr-шаблон.
+    if str(cfg.get("template_path") or "").strip().lower() == "template_snt.xlsx":
+        cfg["template_path"] = "template_burmistr.xlsx"
+
+    return cfg
 
 
 # ----------------------------- text helpers -----------------------------
@@ -471,17 +533,33 @@ def has_extra_trailing_unit_without_marker(address: str, search_house_no: str = 
 def extract_house_no(address: str) -> str:
     """
     Номер дома.
-    Сначала ищем явный маркер д/дом, затем fallback для адресов Росреестра вида:
-    "ул Улица, 10, кв 66" — здесь дом 10, а не квартира 66.
+
+    Сначала ищем явный маркер д/дом.
+    Затем fallback для адресов без слова "улица", например:
+    "Ставрополь, Братский, 7, кв 7" — дом 7, квартира 7.
+
+    Это важно: иначе строгая проверка дома не работает для коротких адресов,
+    и поиск может принять "Братский, д 12, кв 7" как подходящий результат
+    для запроса "Братский, 7, кв 7".
     """
     t = normalize_text(address)
-    m = re.search(r"(?:д|дом)[\s\.№:-]*([0-9]+[а-яa-z/-]?)\b", t, re.I)
+
+    # Явный дом: "д 7", "дом 7", "д. №7".
+    m = re.search(r"(?:^|[\s,])(?:д\.?|дом)[\s\.№:-]*([0-9]+[а-яa-z/-]?)\b", t, re.I)
     if m:
         return m.group(1).upper()
-    # Росреестр иногда пишет дом без 'д': 'ул Улица, 10, кв 66'.
+
+    # Росреестр иногда пишет дом без "д": "ул Улица, 10, кв 66".
     m = re.search(r"(?:ул\.?|улица)\s+.+?[,\s]+([0-9]+[а-яa-z/-]?)\s*,?\s*(?:кв\.?|квартира|пом\.?|помещение|№)\b", t, re.I)
     if m:
         return m.group(1).upper()
+
+    # Короткий пользовательский адрес без маркера улицы: "Город, Братский, 7, кв 7".
+    # Берём число непосредственно перед маркером квартиры/помещения/№.
+    m = re.search(r"(?:^|[,\s])([0-9]+[а-яa-z/-]?)\s*,?\s*(?:кв\.?|квартира|пом\.?|помещение|№)\b", t, re.I)
+    if m:
+        return m.group(1).upper()
+
     return ""
 
 
@@ -583,7 +661,30 @@ def build_log_output_path(output_path: Path, kind: str = "") -> Path:
     return output_path.with_name(log_stem + output_path.suffix)
 
 
-RESULT_SHEETS = {"Данные", "Здания и участки", "Кадастровые номера", "Все сведения", "Земельные участки"}
+RESULT_SHEETS = {"Данные", "Здания и участки", "Кадастровые номера", "Земельные участки"}
+
+FULL_WIDE_HEADERS = [
+    "Дата/время",
+    "Поисковый запрос",
+    "Номер помещения",
+    "Кадастровый номер",
+    "Вид объекта",
+    "Статус объекта",
+    "Адрес",
+    "Площадь",
+    "Назначение / ВРИ",
+    "Этаж",
+    "Кадастровая стоимость",
+    "Дата определения кадастровой стоимости",
+    "Дата внесения кадастровой стоимости",
+    "Форма собственности",
+    "Вид права",
+    "Номер регистрации",
+    "Дата регистрации",
+    "Комментарий",
+]
+
+FULL_WIDE_WIDTHS = {1: 18, 2: 55, 3: 18, 4: 24, 5: 22, 6: 18, 7: 70, 8: 16, 9: 35, 10: 12, 11: 20, 12: 24, 13: 24, 14: 24, 15: 35, 16: 30, 17: 18, 18: 55}
 
 
 def workbook_copy(wb):
@@ -764,6 +865,74 @@ def numbered_candidate_priority(row_text: str, expected_flat: str, search_house_
     if address_has_trailing_unit(row_text, expected_flat, search_house_no):
         return 1
     return 9
+
+
+def _clean_place_name(value: Any) -> str:
+    s = normalize_text(value)
+    s = re.sub(r"^[\s,]*(?:г\.?|город|п\.?|пос\.?|поселок|посёлок|с\.?|село|д\.?|деревня|станица|ст-ца)\s+", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip(" ,.")
+    return s
+
+
+def extract_explicit_settlement(address: Any) -> str:
+    """Достаёт населённый пункт из адреса по явным маркерам: г/город/село/посёлок."""
+    t = normalize_text(address)
+    if not t:
+        return ""
+    pattern = (
+        r"(?:^|[\s,])(?:г\.?|город|п\.?|пос\.?|поселок|посёлок|с\.?|село|д\.?|деревня|станица|ст-ца)\s+"
+        r"([а-яa-zё][а-яa-zё\-]*(?:\s+[а-яa-zё][а-яa-zё\-]*){0,2})"
+        r"(?=\s*,|\s+(?:ул\.?|улица|просп\.?|проспект|пр-кт|проезд|пер\.?|переулок|д\.?|дом|кв\.?|квартира|пом\.?|помещение|с/т|с\s*/\s*т|снт|днт|дск|ст|№|участок|уч-к|домостроитель|\d)\b|$)"
+    )
+    m = re.search(pattern, t, flags=re.I)
+    return _clean_place_name(m.group(1)) if m else ""
+
+
+def extract_query_settlement(address: Any) -> str:
+    """Населённый пункт из пользовательского запроса. Поддерживает и короткое: 'Ставрополь, Братский, 7, кв 1'."""
+    explicit = extract_explicit_settlement(address)
+    if explicit:
+        return explicit
+    t = normalize_text(address)
+    if not t:
+        return ""
+    first = re.split(r"[,;]", t)[0].strip(" .")
+    if not first:
+        return ""
+    # Если первый фрагмент уже похож на улицу/дом, город явно не задан.
+    if re.search(r"\b(ул\.?|улица|проспект|проезд|пер\.?|переулок|д\.?|дом|снт|днт|дск|ст|с/т)\b", first, flags=re.I):
+        return ""
+    # Короткий адрес часто начинается с города: 'Ставрополь, Братский, 7, кв 1'.
+    if re.search(r"[а-яa-zё]", first, flags=re.I) and not re.search(r"\d", first):
+        return _clean_place_name(first)
+    return ""
+
+
+def settlement_matches(search_address_or_city: Any, result_address: Any) -> bool:
+    """
+    Проверяет именно населённый пункт, а не регион.
+    Важно: 'Ставрополь' не должен совпадать только с 'Ставропольский край'.
+    """
+    q = extract_query_settlement(search_address_or_city)
+    if not q:
+        q = _clean_place_name(search_address_or_city)
+    q_key = compact_text(q)
+    if not q_key:
+        return True
+
+    r = extract_explicit_settlement(result_address)
+    r_key = compact_text(r)
+    if r_key:
+        return r_key == q_key
+
+    # Fallback для редких строк без 'г.': первый адресный фрагмент должен совпасть с городом целиком.
+    t = normalize_text(result_address)
+    first = re.split(r"[,;]", t)[0].strip(" .")
+    first_key = compact_text(_clean_place_name(first))
+    if first_key == q_key:
+        return True
+
+    return False
 
 
 def house_address_matches(
@@ -963,8 +1132,8 @@ def snt_candidate_match_reason(row_text: str, cad: str, *, city: str, name: str,
     reasons: list[str] = []
 
     city_key = compact_text(city)
-    if city_key and city_key not in row_compact:
-        reasons.append("город не совпал")
+    if city_key and not settlement_matches(city, row_text):
+        reasons.append("населённый пункт не совпал")
 
     name_key = compact_text(name)
     if name_key and name_key not in row_compact:
@@ -1240,6 +1409,9 @@ def address_matches(
         return False
 
     if strict_street and not street_matches(search_address, result_address, strict=True):
+        return False
+
+    if not settlement_matches(search_address, result_address):
         return False
 
     r_compact = compact_text(result_address)
@@ -2010,24 +2182,23 @@ def resolve_old_registry_paths(value: Any) -> list[Path]:
 
 def dedupe_old_records(records: list[OldRegistryRecord]) -> list[OldRegistryRecord]:
     """
-    Убирает только абсолютно одинаковые записи, которые пришли из одного и того же места.
+    Убирает смысловые дубли старых записей между несколькими старыми реестрами.
 
-    Важно: одинаковые ФИО с одинаковым правом в разных строках старого реестра НЕ удаляем.
-    Иногда это не ошибка файла, а несколько долей одного и того же правообладателя.
-    Пример: по квартире 1 четыре доли по 1/4, где один собственник встречается дважды.
+    Если один и тот же собственник с тем же помещением, правом и долей пришёл из двух файлов,
+    это не неоднозначность. Но одинаковые записи из разных строк одного файла также схлопываем
+    только когда совпадает ключ права/ФИО/доля/дата.
     """
     result: list[OldRegistryRecord] = []
-    seen: set[tuple[str, str, int, str, str, str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str, str, str]] = set()
     for r in records:
         key = (
-            r.source_file,
-            r.sheet,
-            int(r.row or 0),
             (r.right_key or "").upper(),
             (r.flat_no or "").upper(),
+            compact_text(r.cadastral_number or "").upper(),
             normalize_text(r.fio_original),
             normalize_text(r.share),
             normalize_text(r.reg_date),
+            normalize_text(r.contract_text or r.raw_right),
         )
         if key in seen:
             continue
@@ -2509,7 +2680,7 @@ def infer_roskvartal_room_type(row: dict[str, Any]) -> str:
         val = str(row.get(key) or "").strip()
         if val and val != ".":
             return val
-    return "Помещение"
+    return "Квартира"
 
 
 def build_roskvartal_sheet_from_data(wb, *, source_sheet: str = "Данные", target_sheet: str = "Roskvartal") -> None:
@@ -2999,17 +3170,30 @@ def reconcile_registries(
                         highlight_reconcile_rows(ws, [row_idx], share_col=cols.get("share"), reason=reason)
                     elif same_new_rows:
                         ordinal = same_new_rows.index(row_idx) if row_idx in same_new_rows else 0
+                        if len(same_new_rows) < len(by_flat):
+                            # Если старых записей несколько, но это один и тот же ФИО
+                            # из разных старых файлов/строк, это не неоднозначность.
+                            # Схлопываем варианты и переносим единственного человека.
+                            unique_by_person: dict[str, OldRegistryRecord] = {}
+                            for rec in by_flat:
+                                person_key = normalize_text(" ".join([rec.last_name, rec.first_name, rec.patronymic])) or normalize_text(rec.fio_original)
+                                share_key = normalize_text(rec.share)
+                                unique_by_person.setdefault(f"{person_key}|{share_key}", rec)
+                            if len(unique_by_person) == 1:
+                                chosen = [next(iter(unique_by_person.values()))]
+                                should_expand = False
+                                match_type = "номер регистрации + помещение, одинаковый ФИО в старых реестрах"
+                            else:
+                                stats["ambiguous"] += 1
+                                reason = f"Старых записей по праву больше ({len(by_flat)}), чем строк Росреестра с этим правом ({len(same_new_rows)}); ФИО не перенесено автоматически"
+                                ambiguous.append([row_idx, flat, reg_raw, "", reason, "; ".join(r.fio_original for r in by_flat)])
+                                highlight_reconcile_rows(ws, [row_idx], share_col=cols.get("share"), reason=reason)
+                                match_log.append([row_idx, flat, reg_raw, "не перенесено", "неоднозначно: старых ФИО больше, чем новых строк", "", "", "; ".join(r.fio_original for r in by_flat)])
+                                continue
                         if ordinal < len(by_flat):
                             chosen = [by_flat[ordinal]]
                             should_expand = False
-                            if len(same_new_rows) < len(by_flat):
-                                match_type = "номер регистрации + помещение, по порядку, часть старых собственников не перенесена"
-                                stats["ambiguous"] += 1
-                                reason = f"Старых записей по праву больше ({len(by_flat)}), чем строк Росреестра с этим правом ({len(same_new_rows)}); перенесены только строки с сохранившимся правом"
-                                ambiguous.append([row_idx, flat, reg_raw, "", reason, "; ".join(r.fio_original for r in by_flat)])
-                                highlight_reconcile_rows(ws, [row_idx], share_col=cols.get("share"), reason=reason)
-                            else:
-                                match_type = "номер регистрации + помещение, по порядку"
+                            match_type = "номер регистрации + помещение, по порядку"
                         else:
                             stats["ambiguous"] += 1
                             reason = f"В новом реестре строк по праву больше ({len(same_new_rows)}), чем записей в старом ({len(by_flat)}); требуется проверка"
@@ -3309,7 +3493,7 @@ def validate_existing_registry_excel(input_path: Path, output_path: Path) -> dic
 
 
 def collect_snt_not_found_plots_from_workbook(path: Path) -> list[str]:
-    """Читает result-файл СНТ и возвращает номера участков со строками «не найдено»."""
+    """Читает итоговый файл СНТ и возвращает номера участков со строками «не найдено»."""
     try:
         from openpyxl import load_workbook
         wb = load_workbook(path, data_only=True)
@@ -3353,8 +3537,8 @@ def snt_result_totals_from_sheet(ws) -> dict[str, int]:
     comment_col = headers.get(normalize_text("Комментарий"))
     if not plot_col:
         return {
-            "Строк в result-файле по земельным участкам": 0,
-            "Уникальных земельных участков в result-файле": 0,
+            "Строк в итоговый файле по земельным участкам": 0,
+            "Уникальных земельных участков в итоговый файле": 0,
             "Актуальных земельных участков, уникально": 0,
             "Погашенных земельных участков, уникально": 0,
             "Не найдено участков, уникально": 0,
@@ -3390,8 +3574,8 @@ def snt_result_totals_from_sheet(ws) -> dict[str, int]:
     not_found = {p for p in not_found if p not in actual and p not in redeemed}
     multi_status = {p for p, statuses in status_by_plot.items() if len(statuses - {"Не найдено"}) > 1}
     return {
-        "Строк в result-файле по земельным участкам": data_rows,
-        "Уникальных земельных участков в result-файле": len(all_plots),
+        "Строк в итоговый файле по земельным участкам": data_rows,
+        "Уникальных земельных участков в итоговый файле": len(all_plots),
         "Актуальных земельных участков, уникально": len(actual),
         "Погашенных земельных участков, уникально": len(redeemed),
         "Не найдено участков, уникально": len(not_found),
@@ -3406,7 +3590,7 @@ def snt_building_totals_from_sheet(ws) -> dict[str, int]:
     status_col = headers.get(normalize_text("Статус объекта"))
     cad_col = headers.get(normalize_text("Кадастровый номер"))
     if not plot_col:
-        return {"Зданий в result-файле, строк": 0, "Зданий в result-файле, уникально": 0}
+        return {"Зданий в итоговый файле, строк": 0, "Зданий в итоговый файле, уникально": 0}
     rows = 0
     unique: set[str] = set()
     actual: set[str] = set()
@@ -3427,10 +3611,10 @@ def snt_building_totals_from_sheet(ws) -> dict[str, int]:
         elif key:
             actual.add(key)
     return {
-        "Зданий в result-файле, строк": rows,
-        "Зданий в result-файле, уникально": len(unique),
-        "Актуальных/действующих зданий в result-файле": len(actual),
-        "Погашенных зданий в result-файле": len(redeemed),
+        "Зданий в итоговый файле, строк": rows,
+        "Зданий в итоговый файле, уникально": len(unique),
+        "Актуальных/действующих зданий в итоговый файле": len(actual),
+        "Погашенных зданий в итоговый файле": len(redeemed),
     }
 
 class ExcelOutput:
@@ -3463,9 +3647,13 @@ class ExcelOutput:
         self._seen_cadastral: set[str] = set()
         self._seen_reg_keys: set[tuple[str, str]] = set()
 
-        if self.export_format == "snt":
+        if self.export_format == "full":
+            self.full_wide_ws = self._make_sheet("Полные сведения", FULL_WIDE_HEADERS, FULL_WIDE_WIDTHS)
+            self._prepare_errors_sheet()
+            self._prepare_extra_sheets()
+        elif self.export_format == "snt":
             # СНТ не должен подготавливать листы ОСС/Burmistr.
-            # При дозаписи в существующий result-файл старые строки сохраняем.
+            # При дозаписи в существующий итоговый файл старые строки сохраняем.
             if "Земельные участки" in self.wb.sheetnames:
                 self.snt_ws = self.wb["Земельные участки"]
                 normalize_snt_land_sheet_headers(self.snt_ws)
@@ -3514,9 +3702,9 @@ class ExcelOutput:
                         dst.column_dimensions[key].width = dim.width
                     except Exception:
                         pass
-            self.log(f"Продолжение: старый log-файл подмешан: {log_path}")
+            self.log(f"Продолжение: старый служебный log-файл подмешан: {log_path}")
         except Exception as e:
-            self.log(f"Не удалось подмешать старый log-файл: {e}")
+            self.log(f"Не удалось подмешать старый служебный log-файл: {e}")
 
     def remove_snt_not_found_rows(self, plot_no: str) -> int:
         """Удаляет старые строки «не найдено» по участку перед перепроверкой или успешной записью."""
@@ -3721,7 +3909,7 @@ class ExcelOutput:
         self.summary_ws = self._make_sheet("Сводка", SUMMARY_HEADERS, {1: 42, 2: 80})
         self.validation_ws = self._make_sheet("Проверка", VALIDATION_HEADERS, {2: 14, 3: 22, 4: 12, 5: 28, 6: 75})
         self.cad_only_ws = self._make_sheet("Кадастровые номера", cad_headers, {2: 55, 4: 24, 5: 80, 6: 24, 7: 55})
-        self.full_info_ws = self._make_sheet("Все сведения", full_headers, {2: 55, 3: 18, 4: 24, 5: 65, 6: 22, 8: 38, 9: 42, 10: 90})
+        self.full_info_ws = self._make_sheet("Все сведения карточки", full_headers, {2: 55, 3: 18, 4: 24, 5: 65, 6: 22, 8: 38, 9: 42, 10: 90})
 
     def _append_row(self, ws, row: list[Any]) -> None:
         row_idx = ws.max_row + 1
@@ -3786,9 +3974,41 @@ class ExcelOutput:
         ])
 
     def append_full_object_info(self, info: ObjectInfo, search_address: str = "") -> int:
-        rows = extract_full_info_fields(info.raw_text or "")
+        """Пишет полный режим в читаемый широкий лист, а технический вертикальный разбор — только в log."""
+        raw = info.raw_text or ""
+        cost_date = card_field(raw, "Дата определения") or ""
+        cost_input_date = card_field(raw, "Дата внесения") or ""
+        rights = info.rights or [RightInfo(".", ".", "")]
+
+        if not hasattr(self, "full_wide_ws") or self.full_wide_ws is None:
+            self.full_wide_ws = self._make_sheet("Полные сведения", FULL_WIDE_HEADERS, FULL_WIDE_WIDTHS)
+
+        wide_count = 0
+        for right in rights:
+            self._append_row(self.full_wide_ws, [
+                datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                search_address,
+                info.flat_no or ".",
+                info.cadastral_number or ".",
+                info.object_type or ".",
+                info.status or ".",
+                info.address or ".",
+                info.area or ".",
+                info.purpose or ".",
+                info.floor or "",
+                info.cadastral_cost or "",
+                cost_date,
+                cost_input_date,
+                info.ownership_form or "",
+                right.right_type or ".",
+                right.reg_number or ".",
+                right.reg_date or "",
+                "Полные сведения по карточке объекта",
+            ])
+            wide_count += 1
+
+        rows = extract_full_info_fields(raw)
         if not rows:
-            # fallback, если сайт изменит DOM и общий разбор не найдёт пары.
             rows = [
                 ("Общая информация", "Вид объекта недвижимости", info.object_type or ".", 1),
                 ("Общая информация", "Статус объекта", info.status or ".", 2),
@@ -3800,7 +4020,7 @@ class ExcelOutput:
                 ("Сведения о кадастровой стоимости", "Кадастровая стоимость", info.cadastral_cost or ".", 8),
             ]
 
-        count = 0
+        vertical_count = 0
         for section, field, value, order in rows:
             self._append_row(self.full_info_ws, [
                 datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
@@ -3815,8 +4035,8 @@ class ExcelOutput:
                 value,
                 order,
             ])
-            count += 1
-        return count
+            vertical_count += 1
+        return wide_count
 
     def ensure_snt_sheet(self):
         if hasattr(self, "snt_ws") and self.snt_ws is not None:
@@ -3840,7 +4060,7 @@ class ExcelOutput:
         return self.snt_building_ws
 
     def append_snt_building(self, info: ObjectInfo, plot_no: str, search_address: str = "", comment: str = "") -> int:
-        """Пишет здание/дом, найденный в СНТ, на отдельный лист result-файла."""
+        """Пишет здание/дом, найденный в СНТ, на отдельный лист итоговый файла."""
         ws = self.ensure_snt_building_sheet()
         raw = info.raw_text or ""
         floors = card_field(raw, "Количество этажей") or ""
@@ -3951,6 +4171,8 @@ class ExcelOutput:
         ])
 
     def validate_result(self) -> None:
+        if self.export_format == "full":
+            return
         # Очищаем старые результаты проверки, оставляя заголовок.
         self.validation_ws.delete_rows(2, self.validation_ws.max_row)
         headers = {normalize_text(self.ws.cell(1, c).value): c for c in range(1, self.ws.max_column + 1) if self.ws.cell(1, c).value}
@@ -3995,10 +4217,9 @@ class ExcelOutput:
                 flat_groups.setdefault(flat.upper(), []).append((row_idx, frac, share))
 
             if cad and cad != "." and reg:
-                key = (cad, reg)
-                if key in validation_seen_reg_keys:
-                    self.append_duplicate("Кадастровый номер + регистрация", f"{cad}|{reg}", f"Данные!{row_idx}", cad, reg, "Повтор в основном листе")
-                validation_seen_reg_keys.add(key)
+                # Одинаковый КН + номер регистрации может законно повторяться для нескольких собственников/долей.
+                # Не пишем это как дубль, чтобы не пугать пользователя ложными ошибками.
+                validation_seen_reg_keys.add((cad, reg))
 
             if reg and reg != ".":
                 person_key = normalize_text(" ".join([last, first, patr])).strip()
@@ -4048,13 +4269,9 @@ class ExcelOutput:
         row_idx = self.ws.max_row + 1
         cad_for_dupe = str(values.get("Кадастровый номер", "") or "").strip()
         reg_for_dupe = str(values.get("Номер регистрации (обяз.)", "") or "").strip()
-        # Один кадастровый номер может законно повторяться по нескольким правам/долям.
-        # Дублем считаем только повтор той же пары КН + номер регистрации.
         if cad_for_dupe and reg_for_dupe:
-            key = (cad_for_dupe, reg_for_dupe)
-            if key in self._seen_reg_keys:
-                self.append_duplicate("Кадастровый номер + регистрация", f"{cad_for_dupe}|{reg_for_dupe}", f"Данные!{row_idx}", cad_for_dupe, reg_for_dupe, "Пара КН+регистрация уже встречалась раньше")
-            self._seen_reg_keys.add(key)
+            # Одинаковый КН + регистрация может быть нормой для долевой/совместной собственности.
+            self._seen_reg_keys.add((cad_for_dupe, reg_for_dupe))
 
         headers_to_write = getattr(self, "data_headers", REQUIRED_HEADERS)
         for header in headers_to_write:
@@ -4091,6 +4308,8 @@ class ExcelOutput:
             result_sheets = {"Roskvartal"}
         elif self.export_format == "snt":
             result_sheets = {"Земельные участки", "Здания"}
+        elif self.export_format == "full":
+            result_sheets = {"Полные сведения"}
         else:
             result_sheets = RESULT_SHEETS
         self.log_path = save_result_and_log_workbooks(self.wb, self.output_path, result_sheets=result_sheets, log_kind="result")
@@ -4175,14 +4394,20 @@ class ParserWorker(threading.Thread):
         return not self.stop_event.is_set()
 
     def build_progress_path(self, base: Path, address_prefix: str, start_flat: int, end_flat: int) -> Path:
-        if self.parser_mode() == "snt":
+        mode = self.parser_mode()
+        if mode == "snt":
             city = str(self.cfg.get("snt_city") or "").strip()
             name = str(self.cfg.get("snt_name") or "").strip()
             quarters = "_".join(parse_cadastral_quarters(self.cfg.get("snt_cadastral_quarters") or "")) or "all_quarters"
-            slug = filename_slug(f"snt_{city}_{name}_{quarters}") or "snt"
+            slug = filename_slug(f"snt_{city}_{name}_{quarters}_{start_flat}-{end_flat}") or "snt"
             return base / "state" / f"progress_{slug}.json"
+
+        # Прогресс ОСС, полного режима и режима кадастровых номеров должен быть раздельным.
+        # Иначе запуск "Полные сведения" может отметить квартиры обработанными,
+        # а следующий запуск "Реестр для ОСС" пропустит их и сохранит пустой result.
         house = house_address_from_prefix(address_prefix) or address_prefix or "house"
-        slug = filename_slug(f"{house}_kv_{start_flat}-{end_flat}") or "progress"
+        mode_prefix = mode if mode in {"oss", "full", "cadastral"} else "oss"
+        slug = filename_slug(f"{mode_prefix}_{house}_kv_{start_flat}-{end_flat}") or f"progress_{mode_prefix}"
         return base / "state" / f"progress_{slug}.json"
 
     def load_progress_state(self, path: Path) -> dict[str, Any]:
@@ -4307,11 +4532,13 @@ class ParserWorker(threading.Thread):
 
         base = app_dir()
         template_path = Path(self.cfg.get("template_path") or "template_burmistr.xlsx")
-        if self.parser_mode() == "snt" and template_path.name.lower() in {"template.xlsx", "template_burmistr.xlsx", ""}:
-            template_path = Path("template_snt.xlsx")
-        elif self.parser_mode() == "oss" and str(self.cfg.get("oss_export_format") or "burmistr") == "burmistr" and template_path.name.lower() in {"template.xlsx", ""}:
+        if self.parser_mode() == "snt":
+            template_path = Path(self.cfg.get("snt_template_path") or "template_snt.xlsx")
+        elif self.parser_mode() == "full":
+            template_path = Path(self.cfg.get("full_info_template_path") or "template_full_info.xlsx")
+        elif self.parser_mode() == "oss" and str(self.cfg.get("oss_export_format") or "burmistr") == "burmistr" and template_path.name.lower() in {"template.xlsx", "", "template_snt.xlsx"}:
             template_path = Path("template_burmistr.xlsx")
-        elif self.parser_mode() == "oss" and str(self.cfg.get("oss_export_format") or "burmistr") == "roskvartal" and template_path.name.lower() in {"template.xlsx", "template_burmistr.xlsx", ""}:
+        elif self.parser_mode() == "oss" and str(self.cfg.get("oss_export_format") or "burmistr") == "roskvartal" and template_path.name.lower() in {"template.xlsx", "template_burmistr.xlsx", "", "template_snt.xlsx"}:
             template_path = Path("template_roskvartal.xlsx")
         if not template_path.is_absolute():
             # Сначала рядом с программой, потом как ресурс PyInstaller.
@@ -4331,6 +4558,12 @@ class ParserWorker(threading.Thread):
         resume_enabled = bool(self.cfg.get("resume_enabled", True))
         self.progress_path = self.build_progress_path(base, address_prefix, start_flat, end_flat)
         self.progress_state = self.load_progress_state(self.progress_path) if resume_enabled else {}
+        if resume_enabled and self.progress_state.get("output_path") and not Path(str(self.progress_state.get("output_path"))).exists():
+            self.log(
+                "Найден файл прогресса, но прежний Excel-результат отсутствует. "
+                "Вероятно, итоговый файл был перенесён или удалён. Прогресс для пропуска объектов сброшен."
+            )
+            self.progress_state = {}
         append_existing = False
 
         if resume_enabled and self.progress_state.get("output_path") and Path(str(self.progress_state.get("output_path"))).exists():
@@ -4347,6 +4580,8 @@ class ParserWorker(threading.Thread):
 
         if self.parser_mode() == "snt":
             export_format = "snt"
+        elif self.parser_mode() == "full":
+            export_format = "full"
         elif self.parser_mode() == "oss":
             export_format = str(self.cfg.get("oss_export_format") or "burmistr")
         else:
@@ -4382,7 +4617,7 @@ class ParserWorker(threading.Thread):
             })
             self.save_progress_state()
             if self.done_units:
-                self.log(f"Продолжение с места включено. Уже обработано номеров: {len(self.done_units)}. Файл прогресса: {self.progress_path}")
+                self.log(f"Продолжение с места включено. Уже обработано номеров: {len(self.done_units)}. Служебный файл прогресса: {self.progress_path}")
 
         profile_dir = Path(self.cfg.get("browser_profile_dir") or "profile_rosreestr")
         if not profile_dir.is_absolute():
@@ -4547,12 +4782,12 @@ class ParserWorker(threading.Thread):
                 "Спорных участков за запуск": self.metrics.get("Спорных результатов", 0),
                 "Ошибок за запуск": self.metrics.get("Ошибок", 0),
                 "Лимитов Росреестра за запуск": self.metrics.get("Лимитов Росреестра", 0),
-                "=== Весь result-файл ===": "",
+                "=== Весь итоговый файл ===": "",
             }
             try:
                 summary.update(self.excel.snt_result_totals() if self.excel else {})
             except Exception as e:
-                summary["Итог result-файла"] = f"Не удалось посчитать: {e}"
+                summary["Итог итоговый файла"] = f"Не удалось посчитать: {e}"
         else:
             summary = {
                 "Версия программы": APP_TITLE,
@@ -4560,7 +4795,6 @@ class ParserWorker(threading.Thread):
                 "Дата/время окончания": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
                 "Адрес до номера": address_prefix,
                 "Режим парсинга": PARSER_MODE_LABELS.get(str(self.cfg.get("parser_mode") or "oss"), str(self.cfg.get("parser_mode") or "oss")),
-                "Формат выгрузки ОСС": OSS_EXPORT_FORMAT_LABELS.get(str(self.cfg.get("oss_export_format") or "burmistr"), str(self.cfg.get("oss_export_format") or "burmistr")),
                 "Диапазон": f"{start_flat}–{end_flat}",
                 "Дополнительные номера": str(self.cfg.get("extra_unit_numbers") or "").strip(),
                 "Ручная очередь": str(self.cfg.get("manual_unit_numbers") or "").strip(),
@@ -4570,6 +4804,8 @@ class ParserWorker(threading.Thread):
                 "Только собрать кадастровые номера": "да" if self.cfg.get("collect_cadastral_only") else "нет",
                 "Пресет пауз": self.cfg.get("pause_preset", ""),
             }
+            if self.parser_mode() == "oss":
+                summary["Формат выгрузки ОСС"] = OSS_EXPORT_FORMAT_LABELS.get(str(self.cfg.get("oss_export_format") or "burmistr"), str(self.cfg.get("oss_export_format") or "burmistr"))
             summary.update(self.metrics)
         self.excel.write_summary(summary)
 
@@ -4757,7 +4993,7 @@ class ParserWorker(threading.Thread):
                     if self.is_full_info_mode():
                         rows_added = self.excel.append_full_object_info(info, search_address=house_address)
                         self.metrics["Полных карточек"] = self.metrics.get("Полных карточек", 0) + 1
-                        self.log(f"  Полный парсинг по голому адресу: записано строк сведений {rows_added}; КН {info.cadastral_number}")
+                        self.log(f"  Полный парсинг по голому адресу: записано строк в широкий лист {rows_added}; КН {info.cadastral_number}")
                     elif is_building_or_land(info.object_type):
                         self.metrics["Зданий/участков"] = self.metrics.get("Зданий/участков", 0) + 1
                         self.excel.append_building_land(info, source=f"Поиск по голому адресу: {house_address}")
@@ -4884,7 +5120,7 @@ class ParserWorker(threading.Thread):
             return False
 
     def seed_snt_progress_from_excel(self) -> None:
-        """Подхватывает уже записанные участки и КН из существующего result-файла СНТ."""
+        """Подхватывает уже записанные участки и КН из существующего итоговый файла СНТ."""
         if not self.excel or "Земельные участки" not in self.excel.wb.sheetnames:
             return
         try:
@@ -5017,8 +5253,8 @@ class ParserWorker(threading.Thread):
             removed = self.excel.remove_snt_not_found_rows(plot_no)
             if removed:
                 self.log(f"  СНТ: удалены старые строки «не найдено» по участку {plot_no}: {removed}")
-        search_addresses = build_snt_search_addresses(city, name, plot_no, try_variants=bool(self.cfg.get("snt_try_address_variants", True)))
-        if not bool(self.cfg.get("snt_try_address_variants", True)):
+        search_addresses = build_snt_search_addresses(city, name, plot_no, try_variants=bool(self.cfg.get("snt_try_address_variants", False)))
+        if not bool(self.cfg.get("snt_try_address_variants", False)):
             self.log("  СНТ: перебор вариантов адреса выключен, используется один основной запрос.")
         retry_count = int(self.cfg.get("retry_count") or 3)
         rate_limit_retry_count = int(self.cfg.get("rate_limit_retry_count") or 12)
@@ -5217,7 +5453,7 @@ class ParserWorker(threading.Thread):
                         if self.is_full_info_mode():
                             rows_added = self.excel.append_full_object_info(info, search_address=search_address)
                             self.metrics["Полных карточек"] = self.metrics.get("Полных карточек", 0) + 1
-                            self.log(f"  Полный парсинг: записано строк сведений {rows_added}; КН {info.cadastral_number}")
+                            self.log(f"  Полный парсинг: записано строк в широкий лист {rows_added}; КН {info.cadastral_number}")
                             got_actual = True
                             return
 
@@ -5970,7 +6206,7 @@ def update_snt_registry_files(
     if not old_registry_path.exists():
         raise RuntimeError(f"Старый рабочий реестр не найден: {old_registry_path}")
     if not new_result_path.exists():
-        raise RuntimeError(f"Новый result-файл не найден: {new_result_path}")
+        raise RuntimeError(f"Новый итоговый файл не найден: {new_result_path}")
 
     wb_old = load_workbook(old_registry_path)
     wb_new = load_workbook(new_result_path, data_only=True)
@@ -5994,7 +6230,7 @@ def update_snt_registry_files(
             old_land = wb_old.active
         sheet_pairs.append((old_land.title, old_land, wb_new["Земельные участки"]))
     else:
-        raise RuntimeError("В новом result-файле нет листа «Земельные участки»")
+        raise RuntimeError("В новом итоговый файле нет листа «Земельные участки»")
 
     if "Здания" in wb_new.sheetnames:
         if "Здания" not in wb_old.sheetnames:
@@ -6030,12 +6266,12 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1040x760")
-        self.minsize(900, 620)
+        self.geometry("1200x780")
+        self.minsize(1050, 680)
 
         self.base_dir = app_dir()
         self.config_path = self.base_dir / "config.json"
-        self.cfg = load_config(self.config_path)
+        self.cfg = sanitize_loaded_config(load_config(self.config_path))
 
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.ready_event = threading.Event()
@@ -6074,40 +6310,14 @@ class App(tk.Tk):
         def resize_content(event) -> None:
             canvas.itemconfigure(window_id, width=event.width)
 
-        def on_mousewheel(event) -> str:
-            # Windows / macOS
-            if getattr(event, "delta", 0):
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            return "break"
-
-        def on_linux_scroll_up(_event) -> str:
-            canvas.yview_scroll(-3, "units")
-            return "break"
-
-        def on_linux_scroll_down(_event) -> str:
-            canvas.yview_scroll(3, "units")
-            return "break"
-
-        def bind_wheel(_event=None) -> None:
-            self._active_scroll_canvas = canvas
-            self.bind_all("<MouseWheel>", on_mousewheel)
-            self.bind_all("<Button-4>", on_linux_scroll_up)
-            self.bind_all("<Button-5>", on_linux_scroll_down)
-
-        def unbind_wheel(_event=None) -> None:
-            if getattr(self, "_active_scroll_canvas", None) is canvas:
-                self._active_scroll_canvas = None
-                self.unbind_all("<MouseWheel>")
-                self.unbind_all("<Button-4>")
-                self.unbind_all("<Button-5>")
-
         content.bind("<Configure>", update_scrollregion)
         canvas.bind("<Configure>", resize_content)
 
-        # Включаем колесо при наведении на любую область вкладки.
-        for widget in (outer, canvas, content):
-            widget.bind("<Enter>", bind_wheel, add="+")
-            widget.bind("<Leave>", unbind_wheel, add="+")
+        # Колесо мыши должно работать по области вкладки, а не только по scrollbar.
+        if not hasattr(self, "_scrollable_canvases"):
+            self._scrollable_canvases = []
+        self._scrollable_canvases.append(canvas)
+        self._install_global_mousewheel_scroll()
 
         # PageUp/PageDown тоже работают, если фокус внутри вкладки.
         canvas.bind("<Prior>", lambda _e: canvas.yview_scroll(-1, "pages"))
@@ -6115,24 +6325,303 @@ class App(tk.Tk):
 
         return content
 
+    def _make_collapsible_section(self, parent, title: str, *, visible: bool = False):
+        outer = ttk.Frame(parent)
+        outer.pack(fill=tk.X, pady=(8, 0))
+        header = ttk.Frame(outer)
+        header.pack(fill=tk.X)
+        state = {"visible": bool(visible)}
+        body = ttk.LabelFrame(outer, text=title, padding=(8, 6))
+
+        def refresh() -> None:
+            toggle_btn.configure(text=("▾ " if state["visible"] else "▸ ") + title)
+            if state["visible"]:
+                body.pack(fill=tk.X, pady=(4, 0))
+            else:
+                body.pack_forget()
+
+        def toggle() -> None:
+            state["visible"] = not state["visible"]
+            refresh()
+
+        toggle_btn = ttk.Button(header, text="", command=toggle)
+        toggle_btn.pack(anchor="w")
+        refresh()
+        return body, toggle
+
+    def _select_tab(self, tab_index: int) -> None:
+        try:
+            self.notebook.select(tab_index)
+        except Exception:
+            pass
+
+    def _find_scroll_canvas_under_pointer(self):
+        """Возвращает прокручиваемый canvas той вкладки/области, над которой сейчас курсор."""
+        canvases = list(getattr(self, "_scrollable_canvases", []))
+        px = self.winfo_pointerx()
+        py = self.winfo_pointery()
+        for canvas in reversed(canvases):
+            try:
+                if not canvas.winfo_exists() or not canvas.winfo_ismapped():
+                    continue
+                x1 = canvas.winfo_rootx()
+                y1 = canvas.winfo_rooty()
+                x2 = x1 + canvas.winfo_width()
+                y2 = y1 + canvas.winfo_height()
+                if x1 <= px <= x2 and y1 <= py <= y2:
+                    return canvas
+            except Exception:
+                continue
+        return None
+
+    def _install_global_mousewheel_scroll(self) -> None:
+        """Колесо мыши прокручивает ту прокручиваемую вкладку, над которой находится курсор."""
+        if getattr(self, "_global_mousewheel_scroll_installed", False):
+            return
+        self._global_mousewheel_scroll_installed = True
+
+        def on_mousewheel(event):
+            # Если курсор находится над многострочным логом/Wiki-текстом, даём ему прокручиваться самому.
+            try:
+                widget_class = str(event.widget.winfo_class()).lower()
+                if widget_class == "text":
+                    return None
+            except Exception:
+                pass
+            canvas = self._find_scroll_canvas_under_pointer()
+            if canvas is None:
+                return None
+            delta = getattr(event, "delta", 0)
+            if not delta:
+                return None
+            units = int(-1 * (delta / 120))
+            if units == 0:
+                units = -1 if delta > 0 else 1
+            canvas.yview_scroll(units, "units")
+            return "break"
+
+        def on_linux_scroll_up(event):
+            try:
+                widget_class = str(event.widget.winfo_class()).lower()
+                if widget_class == "text":
+                    return None
+            except Exception:
+                pass
+            canvas = self._find_scroll_canvas_under_pointer()
+            if canvas is None:
+                return None
+            canvas.yview_scroll(-3, "units")
+            return "break"
+
+        def on_linux_scroll_down(event):
+            try:
+                widget_class = str(event.widget.winfo_class()).lower()
+                if widget_class == "text":
+                    return None
+            except Exception:
+                pass
+            canvas = self._find_scroll_canvas_under_pointer()
+            if canvas is None:
+                return None
+            canvas.yview_scroll(3, "units")
+            return "break"
+
+        self.bind_all("<MouseWheel>", on_mousewheel, add="+")
+        self.bind_all("<Button-4>", on_linux_scroll_up, add="+")
+        self.bind_all("<Button-5>", on_linux_scroll_down, add="+")
+
+    def _build_home_ui(self, frm: ttk.Frame) -> None:
+        title = ttk.Label(frm, text="Что нужно сделать?", font=("Segoe UI", 16, "bold"))
+        title.pack(anchor="w", pady=(0, 8))
+        subtitle = ttk.Label(
+            frm,
+            text="Выберите задачу. Программа откроет нужную вкладку, а подробные настройки можно менять только при необходимости.",
+            wraplength=1040,
+            foreground="#555555",
+        )
+        subtitle.pack(anchor="w", pady=(0, 14))
+
+        cards = ttk.Frame(frm)
+        cards.pack(fill=tk.X)
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
+
+        def card(row: int, col: int, title_text: str, body_text: str, open_text: str, tab_index: int, wiki_index: int | None = None) -> None:
+            box = ttk.LabelFrame(cards, text=title_text, padding=(12, 10))
+            box.grid(row=row, column=col, sticky="nsew", padx=(0 if col == 0 else 8, 8 if col == 0 else 0), pady=(0, 10))
+            ttk.Label(box, text=body_text, wraplength=480, justify="left").pack(anchor="w", pady=(0, 10))
+            btns = ttk.Frame(box)
+            btns.pack(fill=tk.X)
+            ttk.Button(btns, text=open_text, command=lambda: self._select_tab(tab_index)).pack(side=tk.LEFT, padx=(0, 8))
+            if wiki_index is not None:
+                ttk.Button(btns, text="Открыть WIKI", command=lambda: self._select_tab(wiki_index)).pack(side=tk.LEFT)
+
+        card(0, 0, "ОСС / МКД — собрать реестр",
+             "Для квартир, помещений и машино-мест. Укажите адрес до номера, диапазон или ручную очередь и запустите сбор.",
+             "Открыть парсинг ОСС", 1, 3)
+        card(0, 1, "ОСС / МКД — сопоставить реестры",
+             "Переносит данные из старого Excel/Word-реестра в новый результат парсинга, только при безопасных совпадениях.",
+             "Открыть сопоставление", 2, 3)
+        card(1, 0, "СНТ / земли — собрать участки",
+             "Для земельных участков СНТ/ДНТ/СТ/ДСК. По умолчанию используется быстрый поиск, сложные случаи можно перепроверить отдельно.",
+             "Открыть парсинг СНТ", 4, 6)
+        card(1, 1, "СНТ — актуализировать рабочий реестр",
+             "Обновляет старый рабочий реестр по свежему итоговый файлу и сохраняет пользовательские колонки.",
+             "Открыть актуализацию СНТ", 5, 6)
+
+    def _normalize_pause_preset_value(self, value: Any) -> str:
+        value = str(value or "Обычно")
+        if value in {"Очень медленно", "Вручную"}:
+            return "Пользовательский"
+        if value not in SPEED_PRESET_VALUES:
+            return "Обычно"
+        return value
+
+    def _initial_pause_preset_from_cfg(self) -> str:
+        """Начальный пресет для UI: если значения совпадают с пресетом, показываем понятное имя."""
+        preset = self._normalize_pause_preset_value(self.cfg.get("pause_preset", "Обычно"))
+        try:
+            lo = float(self.cfg.get("pause_min_seconds", 3))
+            hi = float(self.cfg.get("pause_max_seconds", 7))
+        except Exception:
+            lo, hi = 3.0, 7.0
+        for name, (preset_lo, preset_hi) in SPEED_PRESETS.items():
+            if abs(lo - float(preset_lo)) < 0.001 and abs(hi - float(preset_hi)) < 0.001:
+                return name
+        return preset
+
+    def _apply_speed_preset_to_vars(self, preset_var: tk.StringVar, var_map: dict[str, tk.StringVar]) -> None:
+        preset = self._normalize_pause_preset_value(preset_var.get())
+        if preset_var.get() != preset:
+            preset_var.set(preset)
+        if preset not in SPEED_PRESETS:
+            return
+        lo, hi = SPEED_PRESETS[preset]
+        self._updating_speed_fields = True
+        try:
+            if "pause_min_seconds" in var_map:
+                var_map["pause_min_seconds"].set(str(lo))
+            if "pause_max_seconds" in var_map:
+                var_map["pause_max_seconds"].set(str(hi))
+        finally:
+            self._updating_speed_fields = False
+
+    def _preset_name_from_var_values(self, var_map: dict[str, tk.StringVar]) -> str:
+        try:
+            lo = float(var_map.get("pause_min_seconds", tk.StringVar(value="3")).get())
+            hi = float(var_map.get("pause_max_seconds", tk.StringVar(value="7")).get())
+        except Exception:
+            return ""
+        for name, (preset_lo, preset_hi) in SPEED_PRESETS.items():
+            if abs(lo - float(preset_lo)) < 0.001 and abs(hi - float(preset_hi)) < 0.001:
+                return name
+        return ""
+
+    def _refresh_speed_preset_from_values(self, preset_var: tk.StringVar, var_map: dict[str, tk.StringVar]) -> None:
+        name = self._preset_name_from_var_values(var_map)
+        if name:
+            self._updating_speed_fields = True
+            try:
+                preset_var.set(name)
+            finally:
+                self._updating_speed_fields = False
+
+    def _mark_custom_speed_preset(self, preset_var: tk.StringVar, var_map: dict[str, tk.StringVar]) -> None:
+        if getattr(self, "_updating_speed_fields", False) or getattr(self, "_speed_controls_initializing", False):
+            return
+        name = self._preset_name_from_var_values(var_map)
+        if name:
+            if preset_var.get() != name:
+                self._updating_speed_fields = True
+                try:
+                    preset_var.set(name)
+                finally:
+                    self._updating_speed_fields = False
+            return
+        if preset_var.get() in SPEED_PRESETS:
+            preset_var.set("Пользовательский")
+
+    def _bind_speed_controls(self, preset_var: tk.StringVar, var_map: dict[str, tk.StringVar]) -> None:
+        self._speed_controls_initializing = True
+        try:
+            preset_var.set(self._initial_pause_preset_from_cfg())
+            def on_preset_change(*_args) -> None:
+                self._apply_speed_preset_to_vars(preset_var, var_map)
+            preset_var.trace_add("write", on_preset_change)
+            for key in ["pause_min_seconds", "pause_max_seconds", "retry_count", "retry_delay_seconds", "rate_limit_pause_seconds", "rate_limit_retry_count"]:
+                if key in var_map:
+                    var_map[key].trace_add("write", lambda *_args, pv=preset_var, vm=var_map: self._mark_custom_speed_preset(pv, vm))
+            self._apply_speed_preset_to_vars(preset_var, var_map)
+        finally:
+            def finish_init() -> None:
+                self._speed_controls_initializing = False
+                self._refresh_speed_preset_from_values(preset_var, var_map)
+            try:
+                self.after_idle(finish_init)
+            except Exception:
+                finish_init()
+
+    def _refresh_oss_mode_ui(self, *_args) -> None:
+        mode_label = getattr(self, "parser_mode_var", tk.StringVar(value="Реестр для ОСС")).get()
+        show_format = mode_label == "Реестр для ОСС"
+        if hasattr(self, "oss_format_label") and hasattr(self, "oss_format_combo"):
+            if show_format:
+                self.oss_format_label.grid()
+                self.oss_format_combo.grid()
+            else:
+                self.oss_format_label.grid_remove()
+                self.oss_format_combo.grid_remove()
+        hint = ""
+        if mode_label == "Реестр для ОСС":
+            hint = "Итоговый реестр для ОСС. Можно выбрать формат Burmistr или Roskvartal."
+        elif mode_label == "Полные сведения по объектам":
+            hint = "Подробный рабочий Excel по карточкам Росреестра. Не привязан к Burmistr/Roskvartal."
+        elif mode_label == "Реестр кадастровых номеров":
+            hint = "Быстрый сбор кадастровых номеров и основных сведений."
+        if hasattr(self, "parser_mode_hint_var"):
+            self.parser_mode_hint_var.set(hint)
+
+    def _add_labeled_entry(self, parent, row: int, label: str, key: str, *, var_map: dict[str, tk.StringVar], width: int = 60, browse: str | None = None, browse_func: Callable[[str, str], None] | None = None, readonly: bool = False) -> ttk.Entry:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        var = var_map.get(key)
+        if var is None:
+            var = tk.StringVar(value=str(self.cfg.get(key, "")))
+            var_map[key] = var
+        entry = ttk.Entry(parent, textvariable=var, width=width, state="readonly" if readonly else "normal")
+        entry.grid(row=row, column=1, sticky="ew", pady=4)
+        self.bind_editable_widget(entry)
+        if browse:
+            func = browse_func or self._browse
+            btn = ttk.Button(parent, text="Выбрать…", command=lambda: func(key, browse))
+            btn.grid(row=row, column=2, sticky="w", padx=6)
+        return entry
+
     def _build_ui(self) -> None:
         notebook = ttk.Notebook(self)
         notebook.pack(fill=tk.BOTH, expand=True)
 
-        parser_tab = self._make_scrollable_tab(notebook, "Парсинг Росреестра ОСС")
-        match_tab = self._make_scrollable_tab(notebook, "Сопоставление реестра ОСС")
+        home_tab = self._make_scrollable_tab(notebook, "Главная")
+        parser_tab = self._make_scrollable_tab(notebook, "ОСС / МКД — парсинг")
+        match_tab = self._make_scrollable_tab(notebook, "ОСС / МКД — сопоставление")
         wiki_oss_tab = self._make_scrollable_tab(notebook, "WIKI ОСС")
-        snt_tab = self._make_scrollable_tab(notebook, "Парсинг Росреестра СНТ")
-        snt_update_tab = self._make_scrollable_tab(notebook, "Актуализация реестра СНТ")
+        snt_tab = self._make_scrollable_tab(notebook, "СНТ / земли — парсинг")
+        snt_update_tab = self._make_scrollable_tab(notebook, "СНТ — актуализация")
         wiki_snt_tab = self._make_scrollable_tab(notebook, "WIKI СНТ")
         about_tab = self._make_scrollable_tab(notebook, "О программе")
         self.notebook = notebook
         self.bind("<Configure>", self.adjust_log_heights, add="+")
+        self._build_home_ui(home_tab)
 
         frm = parser_tab
 
-        title = ttk.Label(frm, text="Локальный парсер справочной информации Росреестра", font=("Segoe UI", 14, "bold"))
-        title.pack(anchor="w", pady=(0, 10))
+        title = ttk.Label(frm, text="ОСС / МКД — парсинг", font=("Segoe UI", 14, "bold"))
+        title.pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            frm,
+            text="Сбор сведений по квартирам, помещениям и машино-местам. Основные поля видны сразу, расширенные и служебные настройки раскрываются при необходимости.",
+            wraplength=1040,
+            foreground="#555555",
+        ).pack(anchor="w", pady=(0, 10))
 
         profile_bar = ttk.LabelFrame(frm, text="Профиль", padding=(8, 6))
         profile_bar.pack(fill=tk.X, pady=(0, 10))
@@ -6150,154 +6639,126 @@ class App(tk.Tk):
         profile_row2.pack(fill=tk.X)
         ttk.Button(profile_row2, text="Обновить список", command=self.refresh_profiles).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(profile_row2, text="Удалить", command=self.delete_profile).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(profile_row2, text="Открыть profiles", command=self.open_profiles_folder).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(profile_row2, text="Открыть state", command=self.open_state_folder).pack(side=tk.LEFT)
+        ttk.Button(profile_row2, text="Открыть папку профилей", command=self.open_profiles_folder).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(profile_row2, text="Открыть папку прогресса", command=self.open_state_folder).pack(side=tk.LEFT)
         self.refresh_profiles()
 
-        grid = ttk.Frame(frm)
-        grid.pack(fill=tk.X)
+        main_box = ttk.LabelFrame(frm, text="Основные поля", padding=(8, 6))
+        main_box.pack(fill=tk.X, pady=(0, 8))
+        main_grid = ttk.Frame(main_box)
+        main_grid.pack(fill=tk.X)
+        main_grid.columnconfigure(1, weight=1)
 
-        def add_row(row: int, label: str, key: str, width: int = 60, browse: str | None = None) -> None:
-            ttk.Label(grid, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
-            var = tk.StringVar(value=str(self.cfg.get(key, "")))
-            self.vars[key] = var
-            entry = ttk.Entry(grid, textvariable=var, width=width)
-            entry.grid(row=row, column=1, sticky="ew", pady=4)
-            self.bind_editable_widget(entry)
-            if browse:
-                btn = ttk.Button(grid, text="Выбрать…", command=lambda: self._browse(key, browse))
-                btn.grid(row=row, column=2, sticky="w", padx=6)
+        self._add_labeled_entry(main_grid, 0, "Адрес до номера", "address_prefix", var_map=self.vars)
+        self._add_labeled_entry(main_grid, 1, "Начальная квартира/объект", "start_flat", var_map=self.vars, width=12)
+        self._add_labeled_entry(main_grid, 2, "Конечная квартира/объект", "end_flat", var_map=self.vars, width=12)
+        self._add_labeled_entry(main_grid, 3, "Доп. номера к диапазону: 9А, 15Б, 27/1", "extra_unit_numbers", var_map=self.vars)
+        self._add_labeled_entry(main_grid, 4, "Ручная очередь помещений: 1, 2, 3А", "manual_unit_numbers", var_map=self.vars)
+        self._add_labeled_entry(main_grid, 5, "Файл ручной очереди: txt / Excel / Word", "manual_unit_file_path", var_map=self.vars, browse="file")
+        self._add_labeled_entry(main_grid, 6, "Итоговый Excel", "output_path", var_map=self.vars, browse="save")
 
-        grid.columnconfigure(1, weight=1)
-        add_row(0, "Адрес до номера", "address_prefix")
-        add_row(1, "Начальная квартира/объект", "start_flat", width=12)
-        add_row(2, "Конечная квартира/объект", "end_flat", width=12)
-        add_row(3, "Доп. номера к диапазону: 9А, 15Б, 27/1", "extra_unit_numbers")
-        add_row(4, "Ручная очередь помещений: 1, 2, 3А", "manual_unit_numbers")
-        add_row(5, "Файл ручной очереди: txt / Excel / Word", "manual_unit_file_path", browse="file")
-        add_row(6, "Шаблон Excel", "template_path", browse="file")
-        add_row(7, "Итоговый Excel", "output_path", browse="save")
-        add_row(8, "Профиль браузера", "browser_profile_dir", browse="dir")
-        add_row(9, "Канал браузера: chrome / msedge / пусто", "browser_channel", width=20)
-        add_row(10, "URL сервиса", "service_url")
-
-        ttk.Label(grid, text="Режим парсинга").grid(row=11, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(main_grid, text="Режим парсинга").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
         parser_mode_value = str(self.cfg.get("parser_mode") or ("cadastral" if self.cfg.get("collect_cadastral_only") else "oss"))
+        if parser_mode_value == "snt":
+            parser_mode_value = "oss"
         self.parser_mode_var = tk.StringVar(value=PARSER_MODE_LABELS.get(parser_mode_value, "Реестр для ОСС"))
         parser_mode_combo = ttk.Combobox(
-            grid,
+            main_grid,
             textvariable=self.parser_mode_var,
-            values=["Реестр для ОСС", "Реестр всех сведений", "Реестр кадастровых номеров"],
+            values=["Реестр для ОСС", "Полные сведения по объектам", "Реестр кадастровых номеров"],
             state="readonly",
             width=32,
         )
-        parser_mode_combo.grid(row=11, column=1, sticky="w", pady=4)
+        parser_mode_combo.grid(row=7, column=1, sticky="w", pady=4)
 
-        ttk.Label(grid, text="Формат выгрузки ОСС").grid(row=11, column=2, sticky="w", padx=(14, 8), pady=4)
+        self.oss_format_label = ttk.Label(main_grid, text="Формат выгрузки ОСС")
+        self.oss_format_label.grid(row=7, column=2, sticky="w", padx=(14, 8), pady=4)
         oss_format_value = str(self.cfg.get("oss_export_format") or "burmistr")
         self.oss_export_format_var = tk.StringVar(value=OSS_EXPORT_FORMAT_LABELS.get(oss_format_value, "Burmistr"))
-        oss_format_combo = ttk.Combobox(
-            grid,
+        self.oss_format_combo = ttk.Combobox(
+            main_grid,
             textvariable=self.oss_export_format_var,
             values=["Burmistr", "Roskvartal"],
             state="readonly",
             width=16,
         )
-        oss_format_combo.grid(row=11, column=3, sticky="w", pady=4)
+        self.oss_format_combo.grid(row=7, column=3, sticky="w", pady=4)
+
+        self.parser_mode_hint_var = tk.StringVar(value="")
+        ttk.Label(main_grid, textvariable=self.parser_mode_hint_var, foreground="#555555", wraplength=820).grid(row=8, column=1, columnspan=3, sticky="w", pady=(0, 4))
+        self.parser_mode_var.trace_add("write", self._refresh_oss_mode_ui)
+
+        advanced, _toggle_advanced = self._make_collapsible_section(frm, "Расширенные настройки парсинга ОСС", visible=False)
+        advanced_grid = ttk.Frame(advanced)
+        advanced_grid.pack(fill=tk.X)
+        advanced_grid.columnconfigure(0, weight=1)
+        advanced_grid.columnconfigure(1, weight=1)
 
         self.search_numbered_var = tk.BooleanVar(value=bool(self.cfg.get("search_numbered_units", True)))
-        ttk.Checkbutton(
-            grid,
-            text="Искать квартиры/помещения по диапазону номеров",
-            variable=self.search_numbered_var,
-        ).grid(row=12, column=1, sticky="w", pady=2)
-
+        ttk.Checkbutton(advanced_grid, text="Искать квартиры/помещения по диапазону номеров", variable=self.search_numbered_var).grid(row=0, column=0, sticky="w", pady=2)
         self.try_variants_var = tk.BooleanVar(value=bool(self.cfg.get("try_address_variants", True)))
-        ttk.Checkbutton(
-            grid,
-            text="Пробовать варианты номера: кв / квартира / пом. / помещение / №",
-            variable=self.try_variants_var,
-        ).grid(row=13, column=1, sticky="w", pady=2)
-
+        ttk.Checkbutton(advanced_grid, text="Пробовать варианты номера: кв / квартира / пом. / помещение / №", variable=self.try_variants_var).grid(row=1, column=0, sticky="w", pady=2)
         self.strict_street_var = tk.BooleanVar(value=bool(self.cfg.get("strict_street_match", False)))
-        ttk.Checkbutton(
-            grid,
-            text="Строго совпадать улице (не смешивать похожие названия)",
-            variable=self.strict_street_var,
-        ).grid(row=14, column=1, sticky="w", pady=2)
-
+        ttk.Checkbutton(advanced_grid, text="Строго совпадать улице (не смешивать похожие названия)", variable=self.strict_street_var).grid(row=2, column=0, sticky="w", pady=2)
         self.strict_house_var = tk.BooleanVar(value=bool(self.cfg.get("strict_house_match", True)))
-        ttk.Checkbutton(
-            grid,
-            text="Строго совпадать номеру дома",
-            variable=self.strict_house_var,
-        ).grid(row=15, column=1, sticky="w", pady=2)
-
+        ttk.Checkbutton(advanced_grid, text="Строго совпадать номеру дома", variable=self.strict_house_var).grid(row=3, column=0, sticky="w", pady=2)
         self.include_unnumbered_var = tk.BooleanVar(value=bool(self.cfg.get("include_unnumbered_house_objects", False)))
-        ttk.Checkbutton(
-            grid,
-            text="Поиск помещений без номеров: голый адрес дома после диапазона",
-            variable=self.include_unnumbered_var,
-        ).grid(row=16, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(advanced_grid, text="Поиск помещений без номеров: голый адрес дома после диапазона", variable=self.include_unnumbered_var).grid(row=4, column=0, sticky="w", pady=2)
 
         self.auto_output_filename_var = tk.BooleanVar(value=bool(self.cfg.get("auto_output_filename", True)))
-        ttk.Checkbutton(
-            grid,
-            text="Автоимя итогового файла по адресу дома",
-            variable=self.auto_output_filename_var,
-        ).grid(row=17, column=1, sticky="w", pady=2)
-
+        ttk.Checkbutton(advanced_grid, text="Автоимя итогового файла по адресу дома", variable=self.auto_output_filename_var).grid(row=0, column=1, sticky="w", padx=(30, 0), pady=2)
         self.resume_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("resume_enabled", True)))
-        ttk.Checkbutton(
-            grid,
-            text="Продолжение с места: использовать файл прогресса",
-            variable=self.resume_enabled_var,
-        ).grid(row=18, column=1, sticky="w", pady=2)
-
+        ttk.Checkbutton(advanced_grid, text="Продолжение с места: использовать файл прогресса", variable=self.resume_enabled_var).grid(row=1, column=1, sticky="w", padx=(30, 0), pady=2)
         self.skip_done_units_var = tk.BooleanVar(value=bool(self.cfg.get("skip_done_units", True)))
-        ttk.Checkbutton(
-            grid,
-            text="Пропускать уже обработанные номера помещений",
-            variable=self.skip_done_units_var,
-        ).grid(row=19, column=1, sticky="w", pady=2)
-
+        ttk.Checkbutton(advanced_grid, text="Пропускать уже обработанные номера помещений", variable=self.skip_done_units_var).grid(row=2, column=1, sticky="w", padx=(30, 0), pady=2)
         self.skip_done_cadastrals_var = tk.BooleanVar(value=bool(self.cfg.get("skip_done_cadastrals", True)))
-        ttk.Checkbutton(
-            grid,
-            text="Пропускать уже найденные кадастровые номера",
-            variable=self.skip_done_cadastrals_var,
-        ).grid(row=20, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(advanced_grid, text="Пропускать уже найденные кадастровые номера", variable=self.skip_done_cadastrals_var).grid(row=3, column=1, sticky="w", padx=(30, 0), pady=2)
 
-        ttk.Label(grid, text="Файл прогресса").grid(row=21, column=0, sticky="w", padx=(0, 8), pady=4)
+        service, _toggle_service = self._make_collapsible_section(frm, "Служебные настройки ОСС", visible=False)
+        service_grid = ttk.Frame(service)
+        service_grid.pack(fill=tk.X)
+        service_grid.columnconfigure(1, weight=1)
+        self._add_labeled_entry(service_grid, 0, "Шаблон Excel", "template_path", var_map=self.vars, browse="file")
+        self._add_labeled_entry(service_grid, 1, "Папка браузерного профиля", "browser_profile_dir", var_map=self.vars, browse="dir")
+        self._add_labeled_entry(service_grid, 2, "Браузер: Chrome / Edge / по умолчанию", "browser_channel", var_map=self.vars, width=20)
+        self._add_labeled_entry(service_grid, 3, "Адрес сервиса Росреестра", "service_url", var_map=self.vars)
+        ttk.Label(service_grid, text="Служебный файл прогресса").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
         self.progress_path_var = tk.StringVar(value="")
-        progress_entry = ttk.Entry(grid, textvariable=self.progress_path_var, state="readonly")
-        progress_entry.grid(row=21, column=1, sticky="ew", pady=4)
+        progress_entry = ttk.Entry(service_grid, textvariable=self.progress_path_var, state="readonly")
+        progress_entry.grid(row=4, column=1, sticky="ew", pady=4)
 
-        opts = ttk.Frame(frm)
+        opts = ttk.LabelFrame(frm, text="Скорость работы", padding=(8, 6))
         opts.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(opts, text="Пресет пауз").grid(row=0, column=0, padx=(0, 4), pady=3, sticky="w")
-        self.pause_preset_var = tk.StringVar(value=str(self.cfg.get("pause_preset", "Обычно")))
-        pause_combo = ttk.Combobox(opts, textvariable=self.pause_preset_var, values=["Быстро", "Обычно", "Медленно", "Очень медленно", "Вручную"], width=16, state="readonly")
+        ttk.Label(opts, text="Пресет").grid(row=0, column=0, padx=(0, 6), pady=3, sticky="w")
+        self.pause_preset_var = tk.StringVar(value=self._initial_pause_preset_from_cfg())
+        pause_combo = ttk.Combobox(opts, textvariable=self.pause_preset_var, values=SPEED_PRESET_VALUES, width=18, state="readonly")
         pause_combo.grid(row=0, column=1, padx=(0, 14), pady=3, sticky="w")
+        ttk.Label(opts, text="Обычно достаточно этого пресета. Ручные значения раскрываются ниже.", foreground="#555555").grid(row=0, column=2, sticky="w", pady=3)
+
+        manual_speed, _toggle_speed = self._make_collapsible_section(frm, "Ручные настройки скорости", visible=False)
+        speed_grid = ttk.Frame(manual_speed)
+        speed_grid.pack(fill=tk.X)
         option_fields = [
-            ("Пауза мин, сек", "pause_min_seconds"),
-            ("Пауза макс, сек", "pause_max_seconds"),
-            ("Повторов", "retry_count"),
-            ("Пауза повтора, сек", "retry_delay_seconds"),
-            ("Замедление браузера, мс", "slow_mo_ms"),
-            ("Пауза при лимите, сек", "rate_limit_pause_seconds"),
-            ("Повторов лимита", "rate_limit_retry_count"),
-            ("Страниц голого адреса", "unnumbered_max_pages"),
+            ("Мин. задержка, сек", "pause_min_seconds"),
+            ("Макс. задержка, сек", "pause_max_seconds"),
+            ("Повторов при ошибке", "retry_count"),
+            ("Пауза перед повтором, сек", "retry_delay_seconds"),
+            ("Пауза при ограничении, сек", "rate_limit_pause_seconds"),
+            ("Повторов после ограничения", "rate_limit_retry_count"),
+            ("Техническое замедление браузера, мс", "slow_mo_ms"),
+            ("Страниц при поиске без номера", "unnumbered_max_pages"),
         ]
         for idx, (label, key) in enumerate(option_fields):
-            row = 1 + idx // 5
-            col = (idx % 5) * 2
-            ttk.Label(opts, text=label).grid(row=row, column=col, padx=(0, 4), pady=3, sticky="w")
+            row = idx // 4
+            col = (idx % 4) * 2
+            ttk.Label(speed_grid, text=label).grid(row=row, column=col, padx=(0, 4), pady=3, sticky="w")
             var = tk.StringVar(value=str(self.cfg.get(key, "")))
             self.vars[key] = var
-            opt_entry = ttk.Entry(opts, textvariable=var, width=8)
+            opt_entry = ttk.Entry(speed_grid, textvariable=var, width=8)
             opt_entry.grid(row=row, column=col + 1, padx=(0, 14), pady=3, sticky="w")
             self.bind_editable_widget(opt_entry)
+        self._bind_speed_controls(self.pause_preset_var, self.vars)
+        self._refresh_oss_mode_ui()
 
         buttons = ttk.Frame(frm)
         buttons.pack(fill=tk.X, pady=12)
@@ -6399,8 +6860,8 @@ class App(tk.Tk):
             "Логин, пароль, SMS-код и капча не вводятся в программу.\n\n"
             "Программа не заказывает платные выписки, не отправляет заявления, "
             "не меняет данные аккаунта и не выполняет юридически значимые действия.\n\n"
-            "Разработано лентяем для лентяев.\n"
-            "Чтобы меньше копировать руками и больше пить чай."
+            "Программа создана для локальной подготовки рабочих реестров "
+            "и снижения ручной работы."
         )
 
         box = tk.Text(frm, height=14, wrap="word", font=("Segoe UI", 11), padx=12, pady=12)
@@ -6569,7 +7030,7 @@ class App(tk.Tk):
             'echo Backup folder:',
             'echo %BACKUP_DIR%',
             'echo.',
-            'echo User files were not intentionally modified: config.json, output, state, profiles, profile_rosreestr, updates.',
+            'echo User files were not intentionally modified: config.json, results, progress, profiles, browser profile, updates.',
             'pause',
             'exit /b 1',
         ]
@@ -6613,7 +7074,7 @@ class App(tk.Tk):
             f"Текущая версия: {APP_TITLE}\n"
             f"Новая версия: {latest_version or latest_code}\n\n"
             "Программа будет закрыта, файлы программы будут обновлены, затем новая версия запустится автоматически.\n\n"
-            "Не будут перезаписаны: config.json, output, state, profiles, profile_rosreestr, updates.",
+            "Не будут перезаписаны: config.json, результаты, прогресс, профили, профиль браузера и скачанные обновления.",
         )
         if not ok:
             return
@@ -6895,47 +7356,38 @@ class App(tk.Tk):
             wiki_text.configure(state="disabled")
 
     def _build_snt_ui(self, frm: ttk.Frame) -> None:
-        title = ttk.Label(frm, text="Реестр земельных участков / СНТ", font=("Segoe UI", 14, "bold"))
-        title.pack(anchor="w", pady=(0, 10))
+        title = ttk.Label(frm, text="СНТ / земли — парсинг", font=("Segoe UI", 14, "bold"))
+        title.pack(anchor="w", pady=(0, 8))
 
         info = ttk.Label(
             frm,
-            text="Этот режим отдельный и не влияет на обычный парсинг квартир/ОСС. Основные признаки: город, название товарищества, номер участка и кадастровый квартал.",
-            wraplength=960,
+            text="Сбор сведений по земельным участкам СНТ/ДНТ/СТ/ДСК. По умолчанию используется быстрый поиск; сложные или не найденные участки можно перепроверить отдельно.",
+            wraplength=1040,
+            foreground="#555555",
         )
         info.pack(anchor="w", pady=(0, 10))
 
-        grid = ttk.Frame(frm)
+        main_box = ttk.LabelFrame(frm, text="Основные поля", padding=(8, 6))
+        main_box.pack(fill=tk.X, pady=(0, 8))
+        grid = ttk.Frame(main_box)
         grid.pack(fill=tk.X)
-
-        def add_snt_row(row: int, label: str, key: str, width: int = 60, browse: str | None = None) -> None:
-            ttk.Label(grid, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
-            var = tk.StringVar(value=str(self.cfg.get(key, "")))
-            self.snt_vars[key] = var
-            entry = ttk.Entry(grid, textvariable=var, width=width)
-            entry.grid(row=row, column=1, sticky="ew", pady=4)
-            self.bind_editable_widget(entry)
-            if browse:
-                btn = ttk.Button(grid, text="Выбрать…", command=lambda: self._browse_snt(key, browse))
-                btn.grid(row=row, column=2, sticky="w", padx=6)
-
         grid.columnconfigure(1, weight=1)
-        add_snt_row(0, "Город / населённый пункт", "snt_city", width=35)
-        add_snt_row(1, "Название товарищества", "snt_name", width=35)
-        add_snt_row(2, "Кадастровые кварталы: 26:12:032003; 26:12:032001", "snt_cadastral_quarters")
-        add_snt_row(3, "Начальный участок", "start_flat", width=12)
-        add_snt_row(4, "Конечный участок", "end_flat", width=12)
-        add_snt_row(5, "Доп. участки: 860А, 1309/1", "extra_unit_numbers")
-        add_snt_row(6, "Ручная очередь участков", "manual_unit_numbers")
-        add_snt_row(7, "Файл ручной очереди: txt / Excel / Word", "manual_unit_file_path", browse="file")
-        add_snt_row(8, "Шаблон Excel СНТ", "template_path", browse="file")
-        add_snt_row(9, "Итоговый Excel", "output_path", browse="save")
-        add_snt_row(10, "Профиль браузера", "browser_profile_dir", browse="dir")
-        add_snt_row(11, "Канал браузера: chrome / msedge / пусто", "browser_channel", width=20)
-        add_snt_row(12, "URL сервиса", "service_url")
 
-        checks = ttk.LabelFrame(frm, text="Настройки СНТ", padding=(8, 6))
-        checks.pack(fill=tk.X, pady=(10, 0))
+        self._add_labeled_entry(grid, 0, "Город / населённый пункт", "snt_city", var_map=self.snt_vars, width=35, browse_func=self._browse_snt)
+        self._add_labeled_entry(grid, 1, "Название товарищества", "snt_name", var_map=self.snt_vars, width=35, browse_func=self._browse_snt)
+        self._add_labeled_entry(grid, 2, "Кадастровые кварталы: 26:12:032003; 26:12:032001", "snt_cadastral_quarters", var_map=self.snt_vars, browse_func=self._browse_snt)
+        self._add_labeled_entry(grid, 3, "Начальный участок", "snt_start_plot", var_map=self.snt_vars, width=12, browse_func=self._browse_snt)
+        self._add_labeled_entry(grid, 4, "Конечный участок", "snt_end_plot", var_map=self.snt_vars, width=12, browse_func=self._browse_snt)
+        self._add_labeled_entry(grid, 5, "Доп. участки: 860А, 1309/1", "snt_extra_unit_numbers", var_map=self.snt_vars, browse_func=self._browse_snt)
+        self._add_labeled_entry(grid, 6, "Ручная очередь участков", "snt_manual_unit_numbers", var_map=self.snt_vars, browse_func=self._browse_snt)
+        self._add_labeled_entry(grid, 7, "Файл ручной очереди: txt / Excel / Word", "snt_manual_unit_file_path", var_map=self.snt_vars, browse="file", browse_func=self._browse_snt)
+        self._add_labeled_entry(grid, 8, "Итоговый Excel", "snt_output_path", var_map=self.snt_vars, browse="save", browse_func=self._browse_snt)
+
+        advanced, _toggle_snt_advanced = self._make_collapsible_section(frm, "Расширенные настройки парсинга СНТ", visible=False)
+        checks = ttk.Frame(advanced)
+        checks.pack(fill=tk.X)
+        checks.columnconfigure(0, weight=1)
+        checks.columnconfigure(1, weight=1)
 
         self.snt_search_numbered_var = tk.BooleanVar(value=bool(self.cfg.get("search_numbered_units", True)))
         ttk.Checkbutton(checks, text="Перебирать участки по диапазону", variable=self.snt_search_numbered_var).grid(row=0, column=0, sticky="w", pady=2)
@@ -6944,16 +7396,16 @@ class App(tk.Tk):
         self.snt_include_redeemed_var = tk.BooleanVar(value=bool(self.cfg.get("snt_include_redeemed", True)))
         ttk.Checkbutton(checks, text="Записывать погашенные участки", variable=self.snt_include_redeemed_var).grid(row=2, column=0, sticky="w", pady=2)
         self.snt_write_buildings_var = tk.BooleanVar(value=bool(self.cfg.get("snt_write_buildings", True)))
-        ttk.Checkbutton(checks, text="СНТ: найденные здания писать в отдельный лист result", variable=self.snt_write_buildings_var).grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(checks, text="Найденные здания писать в отдельный лист результата", variable=self.snt_write_buildings_var).grid(row=3, column=0, sticky="w", pady=2)
         self.snt_write_not_found_var = tk.BooleanVar(value=bool(self.cfg.get("snt_write_not_found", True)))
         ttk.Checkbutton(checks, text="Добавлять не найденные участки в основной файл", variable=self.snt_write_not_found_var).grid(row=4, column=0, sticky="w", pady=2)
-        self.snt_try_address_variants_var = tk.BooleanVar(value=bool(self.cfg.get("snt_try_address_variants", True)))
+        self.snt_try_address_variants_var = tk.BooleanVar(value=bool(self.cfg.get("snt_try_address_variants", False)))
         ttk.Checkbutton(checks, text="Расширенный поиск СНТ — пробовать много вариантов адреса (медленно)", variable=self.snt_try_address_variants_var).grid(row=5, column=0, sticky="w", pady=2)
 
         self.snt_auto_output_filename_var = tk.BooleanVar(value=bool(self.cfg.get("auto_output_filename", True)))
-        ttk.Checkbutton(checks, text="Автоимя result_ по городу и названию СНТ", variable=self.snt_auto_output_filename_var).grid(row=0, column=1, sticky="w", padx=(30, 0), pady=2)
+        ttk.Checkbutton(checks, text="Автоимя итогового файла по городу и названию СНТ", variable=self.snt_auto_output_filename_var).grid(row=0, column=1, sticky="w", padx=(30, 0), pady=2)
         self.snt_append_existing_var = tk.BooleanVar(value=bool(self.cfg.get("snt_append_existing", True)))
-        ttk.Checkbutton(checks, text="Дозаписывать в указанный result-файл, если он уже есть", variable=self.snt_append_existing_var).grid(row=1, column=1, sticky="w", padx=(30, 0), pady=2)
+        ttk.Checkbutton(checks, text="Дозаписывать в выбранный итоговый файл, если он уже есть", variable=self.snt_append_existing_var).grid(row=1, column=1, sticky="w", padx=(30, 0), pady=2)
         self.snt_resume_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("resume_enabled", True)))
         ttk.Checkbutton(checks, text="Продолжение с места", variable=self.snt_resume_enabled_var).grid(row=2, column=1, sticky="w", padx=(30, 0), pady=2)
         self.snt_skip_done_units_var = tk.BooleanVar(value=bool(self.cfg.get("skip_done_units", True)))
@@ -6961,33 +7413,71 @@ class App(tk.Tk):
         self.snt_skip_done_cadastrals_var = tk.BooleanVar(value=bool(self.cfg.get("skip_done_cadastrals", True)))
         ttk.Checkbutton(checks, text="Пропускать уже найденные кадастровые номера", variable=self.snt_skip_done_cadastrals_var).grid(row=4, column=1, sticky="w", padx=(30, 0), pady=2)
 
-        ttk.Label(checks, text="Файл прогресса").grid(row=6, column=0, sticky="w", pady=(8, 2))
+        service, _toggle_snt_service = self._make_collapsible_section(frm, "Служебные настройки СНТ", visible=False)
+        service_grid = ttk.Frame(service)
+        service_grid.pack(fill=tk.X)
+        service_grid.columnconfigure(1, weight=1)
+        self._add_labeled_entry(service_grid, 0, "Шаблон Excel СНТ", "snt_template_path", var_map=self.snt_vars, browse="file", browse_func=self._browse_snt)
+        self._add_labeled_entry(service_grid, 1, "Папка браузерного профиля", "browser_profile_dir", var_map=self.snt_vars, browse="dir", browse_func=self._browse_snt)
+        self._add_labeled_entry(service_grid, 2, "Браузер: Chrome / Edge / по умолчанию", "browser_channel", var_map=self.snt_vars, width=20, browse_func=self._browse_snt)
+        self._add_labeled_entry(service_grid, 3, "Адрес сервиса Росреестра", "service_url", var_map=self.snt_vars, browse_func=self._browse_snt)
+        ttk.Label(service_grid, text="Служебный файл прогресса").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
         self.snt_progress_path_var = tk.StringVar(value="")
-        snt_progress_entry = ttk.Entry(checks, textvariable=self.snt_progress_path_var, state="readonly")
-        snt_progress_entry.grid(row=6, column=1, sticky="ew", padx=(30, 0), pady=(8, 2))
-        checks.columnconfigure(1, weight=1)
+        snt_progress_entry = ttk.Entry(service_grid, textvariable=self.snt_progress_path_var, state="readonly")
+        snt_progress_entry.grid(row=4, column=1, sticky="ew", pady=4)
 
-        opts = ttk.Frame(frm)
+        opts = ttk.LabelFrame(frm, text="Скорость работы", padding=(8, 6))
         opts.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(opts, text="Пресет пауз").grid(row=0, column=0, padx=(0, 4), pady=3, sticky="w")
-        self.snt_pause_preset_var = tk.StringVar(value=str(self.cfg.get("pause_preset", "Обычно")))
-        pause_combo = ttk.Combobox(opts, textvariable=self.snt_pause_preset_var, values=["Быстро", "Обычно", "Медленно", "Очень медленно", "Вручную"], width=16, state="readonly")
+        ttk.Label(opts, text="Пресет").grid(row=0, column=0, padx=(0, 6), pady=3, sticky="w")
+        self.snt_pause_preset_var = tk.StringVar(value=self._initial_pause_preset_from_cfg())
+        pause_combo = ttk.Combobox(opts, textvariable=self.snt_pause_preset_var, values=SPEED_PRESET_VALUES, width=18, state="readonly")
         pause_combo.grid(row=0, column=1, padx=(0, 14), pady=3, sticky="w")
+        ttk.Label(opts, text="Обычно достаточно этого пресета. Ручные значения раскрываются ниже.", foreground="#555555").grid(row=0, column=2, sticky="w", pady=3)
+
+        manual_speed, _toggle_snt_speed = self._make_collapsible_section(frm, "Ручные настройки скорости", visible=False)
+        speed_grid = ttk.Frame(manual_speed)
+        speed_grid.pack(fill=tk.X)
+        snt_speed_fields = [
+            ("Мин. задержка, сек", "pause_min_seconds"),
+            ("Макс. задержка, сек", "pause_max_seconds"),
+            ("Повторов при ошибке", "retry_count"),
+            ("Пауза перед повтором, сек", "retry_delay_seconds"),
+            ("Пауза при ограничении, сек", "rate_limit_pause_seconds"),
+            ("Повторов после ограничения", "rate_limit_retry_count"),
+        ]
+        for idx, (label, key) in enumerate(snt_speed_fields):
+            row = idx // 3
+            col = (idx % 3) * 2
+            ttk.Label(speed_grid, text=label).grid(row=row, column=col, padx=(0, 4), pady=3, sticky="w")
+            var = tk.StringVar(value=str(self.cfg.get(key, "")))
+            self.snt_vars[key] = var
+            opt_entry = ttk.Entry(speed_grid, textvariable=var, width=8)
+            opt_entry.grid(row=row, column=col + 1, padx=(0, 14), pady=3, sticky="w")
+            self.bind_editable_widget(opt_entry)
+        self._bind_speed_controls(self.snt_pause_preset_var, self.snt_vars)
 
         buttons = ttk.Frame(frm)
         buttons.pack(fill=tk.X, pady=12)
-        self.snt_start_btn = ttk.Button(buttons, text="Старт СНТ", command=self.start_snt_worker)
+        row1 = ttk.Frame(buttons)
+        row1.pack(fill=tk.X, pady=(0, 5))
+        self.snt_start_btn = ttk.Button(row1, text="Старт СНТ", command=self.start_snt_worker)
         self.snt_start_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.snt_continue_btn = ttk.Button(buttons, text="Продолжить после входа/капчи", command=self.continue_manual)
+        self.snt_continue_btn = ttk.Button(row1, text="Продолжить после входа/капчи", command=self.continue_manual)
         self.snt_continue_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.snt_pause_btn = ttk.Button(buttons, text="Пауза", command=self.toggle_pause)
+        self.snt_pause_btn = ttk.Button(row1, text="Пауза", command=self.toggle_pause)
         self.snt_pause_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.snt_stop_btn = ttk.Button(buttons, text="Стоп", command=self.stop_worker)
+        self.snt_stop_btn = ttk.Button(row1, text="Стоп", command=self.stop_worker)
         self.snt_stop_btn.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(buttons, text="Сохранить настройки СНТ", command=self.save_snt_settings).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(buttons, text="Сбросить прогресс СНТ", command=self.reset_snt_progress_from_ui).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(buttons, text="Перепроверить не найденные", command=self.start_snt_recheck_not_found).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(buttons, text="Открыть папку результата", command=self.open_output_folder).pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(buttons)
+        row2.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(row2, text="Сохранить настройки СНТ", command=self.save_snt_settings).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row2, text="Перепроверить не найденные", command=self.start_snt_recheck_not_found).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row2, text="Открыть папку результата", command=self.open_snt_output_folder).pack(side=tk.LEFT, padx=(0, 8))
+
+        row3 = ttk.Frame(buttons)
+        row3.pack(fill=tk.X)
+        ttk.Button(row3, text="Сбросить прогресс СНТ", command=self.reset_snt_progress_from_ui).pack(side=tk.LEFT, padx=(0, 8))
 
         log_frame = ttk.LabelFrame(frm, text="Лог СНТ", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -7030,14 +7520,31 @@ class App(tk.Tk):
         cfg = self.cfg.copy()
         for key, var in getattr(self, "snt_vars", {}).items():
             value: Any = var.get().strip()
-            if key in {"start_flat", "end_flat"}:
+            if key in {"snt_start_plot", "snt_end_plot", "retry_count", "rate_limit_retry_count"}:
                 try:
                     value = int(value)
                 except Exception:
                     value = DEFAULT_CONFIG.get(key)
+            if key in {"pause_min_seconds", "pause_max_seconds", "retry_delay_seconds", "rate_limit_pause_seconds"}:
+                try:
+                    value = float(value)
+                except Exception:
+                    value = DEFAULT_CONFIG.get(key)
             cfg[key] = value
+
+        # СНТ хранит свои поля отдельно, а worker всё ещё использует общие
+        # start_flat/end_flat/extra/manual/output/template. Маппинг делаем только
+        # во временном cfg для запуска, не загрязняя вкладку ОСС.
         cfg["parser_mode"] = "snt"
         cfg["collect_cadastral_only"] = False
+        cfg["start_flat"] = int(cfg.get("snt_start_plot") or 1)
+        cfg["end_flat"] = int(cfg.get("snt_end_plot") or cfg.get("start_flat") or 1)
+        cfg["extra_unit_numbers"] = str(cfg.get("snt_extra_unit_numbers") or "")
+        cfg["manual_unit_numbers"] = str(cfg.get("snt_manual_unit_numbers") or "")
+        cfg["manual_unit_file_path"] = str(cfg.get("snt_manual_unit_file_path") or "")
+        cfg["output_path"] = str(cfg.get("snt_output_path") or "output/result.xlsx")
+        cfg["template_path"] = str(cfg.get("snt_template_path") or "template_snt.xlsx")
+
         cfg["search_numbered_units"] = bool(getattr(self, "snt_search_numbered_var", tk.BooleanVar(value=True)).get())
         cfg["auto_output_filename"] = bool(getattr(self, "snt_auto_output_filename_var", tk.BooleanVar(value=True)).get())
         cfg["snt_append_existing"] = bool(getattr(self, "snt_append_existing_var", tk.BooleanVar(value=True)).get())
@@ -7049,27 +7556,42 @@ class App(tk.Tk):
         cfg["snt_write_buildings"] = bool(getattr(self, "snt_write_buildings_var", tk.BooleanVar(value=True)).get())
         cfg["snt_only_land"] = False
         cfg["snt_write_not_found"] = bool(getattr(self, "snt_write_not_found_var", tk.BooleanVar(value=True)).get())
-        cfg["snt_try_address_variants"] = bool(getattr(self, "snt_try_address_variants_var", tk.BooleanVar(value=True)).get())
+        cfg["snt_try_address_variants"] = bool(getattr(self, "snt_try_address_variants_var", tk.BooleanVar(value=False)).get())
         cfg["pause_preset"] = getattr(self, "snt_pause_preset_var", tk.StringVar(value="Обычно")).get()
-        city = str(cfg.get("snt_city") or "").strip()
-        name = str(cfg.get("snt_name") or "").strip()
-        cfg["address_prefix"] = f"{city} {name}".strip()
-        preset = str(cfg.get("pause_preset") or "Обычно")
-        if preset != "Вручную":
-            presets = {
-                "Быстро": (3, 7),
-                "Обычно": (7, 15),
-                "Медленно": (15, 30),
-                "Очень медленно": (30, 60),
-            }
-            if preset in presets:
-                cfg["pause_min_seconds"], cfg["pause_max_seconds"] = presets[preset]
+
+        preset = self._normalize_pause_preset_value(cfg.get("pause_preset") or "Обычно")
+        cfg["pause_preset"] = preset
+        if preset in SPEED_PRESETS:
+            cfg["pause_min_seconds"], cfg["pause_max_seconds"] = SPEED_PRESETS[preset]
         return cfg
 
     def save_snt_settings(self) -> dict[str, Any]:
         cfg = self.collect_snt_cfg()
-        self.cfg.update(cfg)
-        save_config(self.config_path, self.cfg)
+
+        # Сохраняем только СНТ-поля и общие безопасные настройки. Не сохраняем
+        # parser_mode=snt, address_prefix и общие диапазоны, чтобы вкладка ОСС
+        # после перезапуска не превращалась в СНТ.
+        persist_keys = {
+            "snt_city", "snt_name", "snt_cadastral_quarters",
+            "snt_start_plot", "snt_end_plot", "snt_extra_unit_numbers",
+            "snt_manual_unit_numbers", "snt_manual_unit_file_path",
+            "snt_output_path", "snt_template_path",
+            "snt_include_actual", "snt_include_redeemed", "snt_write_buildings",
+            "snt_only_land", "snt_write_not_found", "snt_try_address_variants",
+            "snt_append_existing",
+            "search_numbered_units", "auto_output_filename", "resume_enabled",
+            "skip_done_units", "skip_done_cadastrals",
+            "pause_preset", "pause_min_seconds", "pause_max_seconds",
+            "retry_count", "retry_delay_seconds", "rate_limit_pause_seconds", "rate_limit_retry_count",
+            "browser_profile_dir", "browser_channel", "service_url", "login_url",
+        }
+        for key in persist_keys:
+            if key in cfg:
+                self.cfg[key] = cfg[key]
+        if str(self.cfg.get("parser_mode") or "").strip() == "snt":
+            self.cfg["parser_mode"] = "oss"
+        save_config(self.config_path, sanitize_loaded_config(self.cfg))
+        self.cfg = sanitize_loaded_config(self.cfg)
         self.update_snt_progress_label()
         self.log(f"Настройки СНТ сохранены: {self.config_path}")
         self.apply_live_settings_to_worker(log_message=False)
@@ -7080,7 +7602,9 @@ class App(tk.Tk):
         city = str(cfg.get("snt_city") or "").strip()
         name = str(cfg.get("snt_name") or "").strip()
         quarters = "_".join(parse_cadastral_quarters(cfg.get("snt_cadastral_quarters") or "")) or "all_quarters"
-        slug = filename_slug(f"snt_{city}_{name}_{quarters}") or "progress_snt"
+        start_plot = str(cfg.get("snt_start_plot") or cfg.get("start_flat") or 1)
+        end_plot = str(cfg.get("snt_end_plot") or cfg.get("end_flat") or start_plot)
+        slug = filename_slug(f"snt_{city}_{name}_{quarters}_{start_plot}-{end_plot}") or "progress_snt"
         return self.base_dir / "state" / f"progress_{slug}.json"
 
     def update_snt_progress_label(self) -> None:
@@ -7093,7 +7617,7 @@ class App(tk.Tk):
     def reset_snt_progress_from_ui(self) -> None:
         path = self.current_snt_progress_path()
         if not path.exists():
-            messagebox.showinfo(APP_TITLE, f"Файл прогресса СНТ не найден:\n{path}")
+            messagebox.showinfo(APP_TITLE, f"Служебный файл прогресса СНТ не найден:\n{path}")
             return
         if messagebox.askyesno(APP_TITLE, f"Сбросить прогресс СНТ?\n\n{path}"):
             try:
@@ -7103,7 +7627,7 @@ class App(tk.Tk):
                 messagebox.showerror(APP_TITLE, f"Не удалось удалить прогресс СНТ: {e}")
 
     def resolve_snt_result_path_for_recheck(self) -> Path | None:
-        """Определяет result-файл СНТ для перепроверки не найденных."""
+        """Определяет итоговый файл СНТ для перепроверки не найденных."""
         # В первую очередь берём файл из progress, потому что при автоимени именно там лежит настоящий путь.
         try:
             progress_path = self.current_snt_progress_path()
@@ -7116,7 +7640,7 @@ class App(tk.Tk):
             pass
         raw = ""
         try:
-            raw = self.snt_vars.get("output_path").get().strip()
+            raw = self.snt_vars.get("snt_output_path").get().strip()
         except Exception:
             raw = ""
         if raw:
@@ -7130,11 +7654,11 @@ class App(tk.Tk):
     def start_snt_recheck_not_found(self) -> None:
         result_path = self.resolve_snt_result_path_for_recheck()
         if not result_path:
-            messagebox.showwarning(APP_TITLE, "Не найден result-файл СНТ для перепроверки.")
+            messagebox.showwarning(APP_TITLE, "Не найден итоговый файл СНТ для перепроверки.")
             return
         plots = collect_snt_not_found_plots_from_workbook(result_path)
         if not plots:
-            messagebox.showinfo(APP_TITLE, "В выбранном result-файле не найдено строк «не найдено».")
+            messagebox.showinfo(APP_TITLE, "В выбранном итоговый файле не найдено строк «не найдено».")
             return
         cfg = self.collect_snt_cfg()
         cfg["parser_mode"] = "snt"
@@ -7149,8 +7673,8 @@ class App(tk.Tk):
         cfg["snt_recheck_not_found"] = True
         # Интерфейс тоже обновим, чтобы пользователь видел очередь.
         try:
-            self.snt_vars["manual_unit_numbers"].set(cfg["manual_unit_numbers"])
-            self.snt_vars["output_path"].set(str(result_path))
+            self.snt_vars["snt_manual_unit_numbers"].set(cfg["manual_unit_numbers"])
+            self.snt_vars["snt_output_path"].set(str(result_path))
         except Exception:
             pass
         self.log(f"СНТ: перепроверка не найденных участков: {len(plots)} шт. ({', '.join(plots[:20])}{'...' if len(plots) > 20 else ''})")
@@ -7158,7 +7682,6 @@ class App(tk.Tk):
             if getattr(self.worker, "idle", False):
                 self.pause_event.set()
                 self.ready_event.clear()
-                self.cfg = cfg
                 self.worker.request_next_task(cfg)
                 self.refresh_action_buttons()
                 self.log("Перепроверка СНТ запущена в уже открытом браузере.")
@@ -7169,7 +7692,6 @@ class App(tk.Tk):
         self.pause_event.set()
         self.ready_event.clear()
         self._prompted_close_task_id = 0
-        self.cfg = cfg
         self.worker = ParserWorker(cfg, self.log_queue, self.ready_event, self.pause_event, self.stop_event)
         self.worker.start()
         self.refresh_action_buttons()
@@ -7181,7 +7703,6 @@ class App(tk.Tk):
             if getattr(self.worker, "idle", False):
                 self.pause_event.set()
                 self.ready_event.clear()
-                self.cfg = cfg
                 self.worker.request_next_task(cfg)
                 self.refresh_action_buttons()
                 self.log("Старт СНТ в уже открытом браузере.")
@@ -7192,7 +7713,6 @@ class App(tk.Tk):
         self.pause_event.set()
         self.ready_event.clear()
         self._prompted_close_task_id = 0
-        self.cfg = cfg
         self.worker = ParserWorker(cfg, self.log_queue, self.ready_event, self.pause_event, self.stop_event)
         self.worker.start()
         self.refresh_action_buttons()
@@ -7325,7 +7845,7 @@ class App(tk.Tk):
             messagebox.showwarning(APP_TITLE, "Выберите старый рабочий реестр СНТ.")
             return
         if not new_path:
-            messagebox.showwarning(APP_TITLE, "Выберите новый result-файл после парсинга СНТ.")
+            messagebox.showwarning(APP_TITLE, "Выберите новый итоговый файл после парсинга СНТ.")
             return
         if not out_path:
             out_path = old_path.with_name("updated_" + old_path.name)
@@ -8019,13 +8539,15 @@ class App(tk.Tk):
             if hasattr(self, "snt_write_not_found_var"):
                 self.snt_write_not_found_var.set(bool(self.cfg.get("snt_write_not_found", True)))
             if hasattr(self, "snt_try_address_variants_var"):
-                self.snt_try_address_variants_var.set(bool(self.cfg.get("snt_try_address_variants", True)))
+                self.snt_try_address_variants_var.set(bool(self.cfg.get("snt_try_address_variants", False)))
             mode_value = str(self.cfg.get("parser_mode") or ("cadastral" if self.cfg.get("collect_cadastral_only") else "oss"))
             if hasattr(self, "parser_mode_var"):
                 self.parser_mode_var.set(PARSER_MODE_LABELS.get(mode_value, "Реестр для ОСС") if mode_value in {"oss", "full", "cadastral"} else "Реестр для ОСС")
             if hasattr(self, "oss_export_format_var"):
                 self.oss_export_format_var.set(OSS_EXPORT_FORMAT_LABELS.get(str(self.cfg.get("oss_export_format") or "burmistr"), "Burmistr"))
-            self.pause_preset_var.set(str(self.cfg.get("pause_preset", "Обычно")))
+            self.pause_preset_var.set(self._normalize_pause_preset_value(self.cfg.get("pause_preset", "Обычно")))
+            if hasattr(self, "snt_pause_preset_var"):
+                self.snt_pause_preset_var.set(self._normalize_pause_preset_value(self.cfg.get("pause_preset", "Обычно")))
             self.refresh_profiles()
             self.profile_var.set(path.stem)
             self.log(f"Профиль загружен: {path}")
@@ -8124,6 +8646,8 @@ class App(tk.Tk):
         cfg["auto_output_filename"] = bool(getattr(self, "auto_output_filename_var", tk.BooleanVar(value=True)).get())
         mode_label = getattr(self, "parser_mode_var", tk.StringVar(value="Реестр для ОСС")).get()
         cfg["parser_mode"] = PARSER_MODES.get(mode_label, "oss")
+        if cfg["parser_mode"] == "snt":
+            cfg["parser_mode"] = "oss"
         format_label = getattr(self, "oss_export_format_var", tk.StringVar(value="Burmistr")).get()
         cfg["oss_export_format"] = OSS_EXPORT_FORMATS.get(format_label, "burmistr")
         cfg["collect_cadastral_only"] = cfg["parser_mode"] == "cadastral"
@@ -8144,20 +8668,14 @@ class App(tk.Tk):
                 except Exception:
                     value = DEFAULT_CONFIG.get(key)
             cfg[key] = value
-        preset = str(cfg.get("pause_preset") or "Обычно")
-        if preset != "Вручную":
-            presets = {
-                "Быстро": (3, 7),
-                "Обычно": (7, 15),
-                "Медленно": (15, 30),
-                "Очень медленно": (30, 60),
-            }
-            if preset in presets:
-                cfg["pause_min_seconds"], cfg["pause_max_seconds"] = presets[preset]
-                if "pause_min_seconds" in self.vars:
-                    self.vars["pause_min_seconds"].set(str(cfg["pause_min_seconds"]))
-                if "pause_max_seconds" in self.vars:
-                    self.vars["pause_max_seconds"].set(str(cfg["pause_max_seconds"]))
+        preset = self._normalize_pause_preset_value(cfg.get("pause_preset") or "Обычно")
+        cfg["pause_preset"] = preset
+        if preset in SPEED_PRESETS:
+            cfg["pause_min_seconds"], cfg["pause_max_seconds"] = SPEED_PRESETS[preset]
+            if "pause_min_seconds" in self.vars:
+                self.vars["pause_min_seconds"].set(str(cfg["pause_min_seconds"]))
+            if "pause_max_seconds" in self.vars:
+                self.vars["pause_max_seconds"].set(str(cfg["pause_max_seconds"]))
         return cfg
 
     def current_progress_path(self) -> Path:
@@ -8166,13 +8684,15 @@ class App(tk.Tk):
         end_flat = int(cfg.get("end_flat") or start_flat)
         address_prefix = str(cfg.get("address_prefix") or "").strip()
         house = house_address_from_prefix(address_prefix) or address_prefix or "house"
-        slug = filename_slug(f"{house}_kv_{start_flat}-{end_flat}") or "progress"
+        mode = str(cfg.get("parser_mode") or "oss").strip()
+        mode_prefix = mode if mode in {"oss", "full", "cadastral"} else "oss"
+        slug = filename_slug(f"{mode_prefix}_{house}_kv_{start_flat}-{end_flat}") or f"progress_{mode_prefix}"
         return self.base_dir / "state" / f"progress_{slug}.json"
 
     def reset_progress_from_ui(self) -> None:
         path = self.current_progress_path()
         if not path.exists():
-            messagebox.showinfo(APP_TITLE, f"Файл прогресса не найден:\n{path}")
+            messagebox.showinfo(APP_TITLE, f"Служебный файл прогресса не найден:\n{path}")
             return
         if messagebox.askyesno(APP_TITLE, f"Сбросить прогресс для текущего дома?\n\n{path}"):
             try:
@@ -8194,7 +8714,7 @@ class App(tk.Tk):
         try:
             os.startfile(folder)  # type: ignore[attr-defined]
         except Exception as e:
-            messagebox.showerror(APP_TITLE, f"Не удалось открыть папку profiles: {e}")
+            messagebox.showerror(APP_TITLE, f"Не удалось открыть папку профилей: {e}")
 
     def open_state_folder(self) -> None:
         folder = self.base_dir / "state"
@@ -8202,7 +8722,7 @@ class App(tk.Tk):
         try:
             os.startfile(folder)  # type: ignore[attr-defined]
         except Exception as e:
-            messagebox.showerror(APP_TITLE, f"Не удалось открыть папку state: {e}")
+            messagebox.showerror(APP_TITLE, f"Не удалось открыть папку прогресса: {e}")
 
     def validate_excel_from_ui(self) -> None:
         input_path = filedialog.askopenfilename(
@@ -8359,6 +8879,18 @@ class App(tk.Tk):
     def open_output_folder(self) -> None:
         cfg = self.collect_cfg()
         out = Path(str(cfg.get("output_path") or "output/result.xlsx"))
+        if not out.is_absolute():
+            out = self.base_dir / out
+        folder = out.parent
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(folder)  # type: ignore[attr-defined]
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Не удалось открыть папку: {e}")
+
+    def open_snt_output_folder(self) -> None:
+        cfg = self.collect_snt_cfg()
+        out = Path(str(cfg.get("output_path") or cfg.get("snt_output_path") or "output/result.xlsx"))
         if not out.is_absolute():
             out = self.base_dir / out
         folder = out.parent
