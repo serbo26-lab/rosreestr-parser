@@ -1,18 +1,16 @@
 {
-  "latest_version": "V1.2",
-  "version_code": 12,
+  "latest_version": "V1.3",
+  "version_code": 13,
   "channel": "stable",
   "file_name": "rosreestr_parser.zip",
-  "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v1.2/rosreestr_parser.zip",
-  "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1.2",
-  "sha256": "e0e10433a316eb0bd491c51799846fb231effce67fea83b3cd27ebdcba59d0a0",
+  "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v1.3/rosreestr_parser.zip",
+  "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1.3",
+  "sha256": "6135f66de6cd6322fc13e8a32b9bd65adc90c65b30a73062d9156592eb0f08b9",
   "notes": [
-    "UX-релиз: добавлена вкладка Главная с основными сценариями работы.",
-    "Основные поля ОСС и СНТ оставлены на виду, расширенные и служебные настройки свернуты.",
-    "Единые пресеты скорости для ОСС и СНТ: Быстро, Обычно, Медленно.",
-    "Ручные настройки скорости убраны в раскрываемый блок.",
-    "Режим ОСС «Реестр всех сведений» переименован в «Полные сведения по объектам».",
-    "Формат Burmistr/Roskvartal показывается только для режима «Реестр для ОСС».",
-    "Расширенный поиск СНТ теперь выключен по умолчанию."
+    "Добавлен режим ОСС/МКД “Реестр по списку кадастровых номеров.",
+    "Добавлена проверка Excel/TXT со списком КН.",
+    "Добавлен поиск актуальной замены для погашенных кадастровых номеров",
+    "Улучшено сопоставление долей при неоднозначном переносе ФИО.",
+    "Доработаны задержки и паузы в прессетах."
   ]
 }

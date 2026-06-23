@@ -15,7 +15,7 @@
   "slow_mo_ms": 120,
   "save_after_each_flat": true,
   "close_browser_after_finish": false,
-  "rate_limit_pause_seconds": 300,
+  "rate_limit_pause_seconds": 10,
   "rate_limit_retry_count": 12,
   "try_address_variants": true,
   "include_unnumbered_house_objects": false,
@@ -70,5 +70,8 @@
   "snt_update_add_new_objects": true,
   "repository_url": "https://github.com/serbo26-lab/rosreestr-parser",
   "update_manifest_url": "https://raw.githubusercontent.com/serbo26-lab/rosreestr-parser/main/latest.json",
-  "update_channel": "stable"
+  "update_channel": "stable",
+  "cadastral_queue_file_path": "",
+  "cadastral_queue_validate_address": true,
+  "last_dir_cadastral_queue": ""
 }

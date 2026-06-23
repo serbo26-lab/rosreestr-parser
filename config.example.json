@@ -15,7 +15,7 @@
   "slow_mo_ms": 120,
   "save_after_each_flat": true,
   "close_browser_after_finish": false,
-  "rate_limit_pause_seconds": 300,
+  "rate_limit_pause_seconds": 10,
   "rate_limit_retry_count": 12,
   "try_address_variants": true,
   "include_unnumbered_house_objects": false,
@@ -58,7 +58,7 @@
   "snt_append_existing": true,
   "oss_export_format": "burmistr",
   "match_oss_export_format": "burmistr",
-  "snt_try_address_variants": false,
+  "snt_try_address_variants": true,
   "snt_write_buildings": true,
   "snt_update_old_registry_path": "",
   "snt_update_new_result_path": "",
@@ -71,12 +71,7 @@
   "repository_url": "https://github.com/serbo26-lab/rosreestr-parser",
   "update_manifest_url": "https://raw.githubusercontent.com/serbo26-lab/rosreestr-parser/main/latest.json",
   "update_channel": "stable",
-  "snt_start_plot": 1,
-  "snt_end_plot": 100,
-  "snt_extra_unit_numbers": "",
-  "snt_manual_unit_numbers": "",
-  "snt_manual_unit_file_path": "",
-  "snt_output_path": "output/result.xlsx",
-  "snt_template_path": "template_snt.xlsx",
-  "full_info_template_path": "template_full_info.xlsx"
+  "cadastral_queue_file_path": "",
+  "cadastral_queue_validate_address": true,
+  "last_dir_cadastral_queue": ""
 }

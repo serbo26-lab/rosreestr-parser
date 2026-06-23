@@ -40,8 +40,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
-APP_TITLE = "Парсер Росреестра — V1.2"
-APP_VERSION_CODE = 12
+APP_TITLE = "Парсер Росреестра — V1.3"
+APP_VERSION_CODE = 13
 
 REQUIRED_HEADERS = [
     "Номер помещения (обяз.)",
@@ -210,6 +210,7 @@ OSS_EXPORT_FORMAT_LABELS = {v: k for k, v in OSS_EXPORT_FORMATS.items()}
 
 PARSER_MODES = {
     "Реестр для ОСС": "oss",
+    "Реестр по списку кадастровых номеров": "cad_queue",
     "Полные сведения по объектам": "full",
     "Реестр кадастровых номеров": "cadastral",
 }
@@ -238,6 +239,8 @@ DEFAULT_CONFIG = {
     "extra_unit_numbers": "",
     "manual_unit_numbers": "",
     "manual_unit_file_path": "",
+    "cadastral_queue_file_path": "",
+    "cadastral_queue_validate_address": True,
     "snt_city": "",
     "snt_name": "",
     "snt_cadastral_quarters": "",
@@ -260,7 +263,7 @@ DEFAULT_CONFIG = {
     "pause_max_seconds": 7,
     "retry_count": 3,
     "retry_delay_seconds": 10,
-    "rate_limit_pause_seconds": 300,
+    "rate_limit_pause_seconds": 10,
     "rate_limit_retry_count": 12,
     "browser_profile_dir": "profile_rosreestr",
     "browser_channel": "chrome",
@@ -286,6 +289,7 @@ DEFAULT_CONFIG = {
     "last_dir_template": "",
     "last_dir_output": "",
     "last_dir_manual_queue": "",
+    "last_dir_cadastral_queue": "",
     "last_dir_browser_profile": "",
     "repository_url": "https://github.com/serbo26-lab/rosreestr-parser",
     "update_manifest_url": "https://raw.githubusercontent.com/serbo26-lab/rosreestr-parser/main/latest.json",
@@ -332,6 +336,15 @@ class ObjectInfo:
     raw_text: str = ""
 
 
+
+
+@dataclass
+class CadastralQueueItem:
+    unit_no: str
+    cadastral_number: str
+    sheet: str = ""
+    row_no: int = 0
+    source_note: str = ""
 @dataclass
 class OldRegistryRecord:
     source_file: str
@@ -423,7 +436,7 @@ def sanitize_loaded_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
     # Вкладка ОСС не должна открываться в режиме СНТ. СНТ запускается
     # отдельной кнопкой и передаёт parser_mode=snt только worker'у.
-    if str(cfg.get("parser_mode") or "").strip() == "snt":
+    if str(cfg.get("parser_mode") or "").strip() in {"snt", "cad_queue"}:
         cfg["parser_mode"] = "oss"
         cfg["collect_cadastral_only"] = False
         city_name = f"{cfg.get('snt_city') or ''} {cfg.get('snt_name') or ''}".strip()
@@ -1169,6 +1182,8 @@ def clean_unit_number(value: Any) -> str:
     Очищает номер помещения: 'кв № 9А' -> '9А', 'пом. 12/1' -> '12/1'.
     Случайные слова без цифр не считаем номером.
     """
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     s = str(value or "").strip()
     if not s:
         return ""
@@ -1274,6 +1289,390 @@ def read_manual_units_from_file(path_value: Any) -> list[str]:
 
     return parse_extra_unit_numbers("\n".join(chunks))
 
+
+
+
+CADASTRAL_NUMBER_RE = re.compile(r"\b\d{2}:\d{2}:\d{3,}:\d+\b")
+
+
+def clean_cadastral_number(value: Any) -> str:
+    """Достаёт первый кадастровый номер из значения ячейки/текста."""
+    m = CADASTRAL_NUMBER_RE.search(str(value or ""))
+    return m.group(0) if m else ""
+
+
+def _header_has_any(header: Any, words: list[str]) -> bool:
+    h = normalize_text(header)
+    return any(w in h for w in words)
+
+
+def _guess_unit_from_row(row: tuple[Any, ...], unit_col: int | None = None) -> str:
+    """Пытается взять номер помещения из строки Excel-очереди."""
+    if unit_col is not None and 0 <= unit_col < len(row):
+        direct = clean_unit_number(row[unit_col])
+        if direct:
+            return direct
+        from_addr = extract_flat_no(str(row[unit_col] or ""))
+        if from_addr:
+            return from_addr
+
+    # Сначала адресные значения вида "кв. 37".
+    for value in row:
+        if clean_cadastral_number(value):
+            continue
+        from_addr = extract_flat_no(str(value or ""))
+        if from_addr:
+            return from_addr
+
+    # Затем простая двухколоночная очередь: квартира | кадастровый номер или наоборот.
+    non_cad_values = [v for v in row if str(v or "").strip() and not clean_cadastral_number(v)]
+    for value in non_cad_values[:3]:
+        cleaned = clean_unit_number(value)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def read_cadastral_queue_from_file(path_value: Any) -> list[CadastralQueueItem]:
+    """
+    Читает очередь для МКД по готовому списку кадастровых номеров.
+
+    Поддерживаемый основной формат Excel:
+    - колонка с номером помещения/квартиры;
+    - колонка с кадастровым номером.
+
+    Если заголовки не распознаны, допускается простой чистый лист:
+    квартира | кадастровый номер
+    или
+    кадастровый номер | квартира.
+    """
+    path_str = str(path_value or "").strip().strip('"')
+    if not path_str:
+        return []
+    path = Path(path_str)
+    if not path.exists():
+        raise RuntimeError(f"Файл списка кадастровых номеров не найден: {path}")
+    ext = path.suffix.lower()
+    items: list[CadastralQueueItem] = []
+    seen: set[str] = set()
+
+    def add_item(unit_no: str, cad: str, sheet: str = "", row_no: int = 0, note: str = "") -> None:
+        cad_clean = clean_cadastral_number(cad)
+        if not cad_clean:
+            return
+        if cad_clean in seen:
+            return
+        seen.add(cad_clean)
+        items.append(CadastralQueueItem(unit_no=clean_unit_number(unit_no) or str(unit_no or "").strip() or ".", cadastral_number=cad_clean, sheet=sheet, row_no=row_no, source_note=note))
+
+    if ext in [".xlsx", ".xlsm", ".xltx", ".xltm"]:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, data_only=True, read_only=True)
+        try:
+            for ws in wb.worksheets:
+                header_row_idx: int | None = None
+                cad_col: int | None = None
+                unit_col: int | None = None
+                rows_cache: list[tuple[Any, ...]] = []
+                for row in ws.iter_rows(values_only=True):
+                    rows_cache.append(tuple(row or ()))
+                for r_idx, row in enumerate(rows_cache[:15], start=1):
+                    headers = [normalize_text(v) for v in row]
+                    for c_idx, header in enumerate(headers):
+                        if not header:
+                            continue
+                        if cad_col is None and ("кадастр" in header or header in {"кн", "кад номер", "кад. номер"}):
+                            cad_col = c_idx
+                            header_row_idx = r_idx
+                        if unit_col is None and _header_has_any(header, ["номер помещения", "номер квартиры", "квартира", "помещение", "кв.", "кв"]):
+                            unit_col = c_idx
+                            header_row_idx = r_idx
+                    if cad_col is not None:
+                        break
+
+                start_idx = header_row_idx if header_row_idx is not None else 0
+                for r_idx, row in enumerate(rows_cache[start_idx:], start=start_idx + 1):
+                    cad = ""
+                    if cad_col is not None and cad_col < len(row):
+                        cad = clean_cadastral_number(row[cad_col])
+                    if not cad:
+                        for value in row:
+                            cad = clean_cadastral_number(value)
+                            if cad:
+                                break
+                    if not cad:
+                        continue
+                    unit_no = _guess_unit_from_row(row, unit_col)
+                    add_item(unit_no, cad, ws.title, r_idx)
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+    elif ext in [".txt", ".csv"]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="cp1251", errors="ignore")
+        for r_idx, line in enumerate(text.splitlines(), start=1):
+            cad = clean_cadastral_number(line)
+            if not cad:
+                continue
+            line_without_cad = CADASTRAL_NUMBER_RE.sub(" ", line)
+            unit_no = _guess_unit_from_row(tuple(re.split(r"[;,	 ]+", line_without_cad)))
+            add_item(unit_no, cad, path.name, r_idx)
+    else:
+        raise RuntimeError(f"Формат файла списка КН не поддержан: {ext}. Поддерживаются .xlsx/.xlsm/.txt/.csv")
+
+    return items
+
+
+def cadastral_queue_preview_text(path: Path | str, max_items: int = 80) -> str:
+    # Проверка файла списка КН: сводка + реальные проблемные места.
+    #
+    # Нормальные варианты:
+    # 1) только кадастровые номера;
+    # 2) кадастровые номера + номера квартир/помещений.
+    #
+    # Поэтому отсутствие номера помещения НЕ считается проблемой.
+    p = Path(path)
+    cad_re = re.compile(r"\b\d{2}:\d{2}:\d{3,}:\d+\b")
+
+    def cell_text(value) -> str:
+        if value is None:
+            return ""
+        try:
+            if hasattr(value, "strftime"):
+                return value.strftime("%d.%m.%Y")
+        except Exception:
+            pass
+        return str(value).strip()
+
+    def find_cad(value) -> str:
+        m = cad_re.search(str(value or ""))
+        return m.group(0) if m else ""
+
+    def norm_header(value) -> str:
+        return normalize_text(value)
+
+    def looks_like_unit_header(value) -> bool:
+        n = norm_header(value)
+        if not n or "кадастр" in n:
+            return False
+        return (
+            ("номер" in n and ("помещ" in n or "кварт" in n or "объект" in n))
+            or n in {"квартира", "кв", "помещение", "пом", "номер квартиры", "номер помещения"}
+        )
+
+    def looks_like_cad_header(value) -> bool:
+        return "кадастр" in norm_header(value)
+
+    def is_real_unit(value) -> bool:
+        raw = str(value or "").strip()
+        if not raw or raw == ".":
+            return False
+        # owner:2, Sheet1:15, Лист1:20 — служебный источник, не номер квартиры.
+        if re.fullmatch(r"(?i)[a-zа-яё0-9 _.-]{1,40}:\d{1,7}", raw):
+            return False
+        if cad_re.search(raw):
+            return False
+        cleaned = clean_unit_number(raw)
+        if not cleaned or cleaned == ".":
+            return False
+        return bool(re.search(r"\d", cleaned))
+
+    def norm_unit(value) -> str:
+        return clean_unit_number(value or "")
+
+    def short_list(values: list[str], limit: int = 40) -> str:
+        vals = [str(v) for v in values if str(v).strip()]
+        if not vals:
+            return "нет"
+        head = vals[:limit]
+        suffix = "" if len(vals) <= limit else f" ... ещё {len(vals) - limit}"
+        return ", ".join(head) + suffix
+
+    raw_rows: list[dict[str, str]] = []
+    units_without_cad: list[str] = []
+
+    if not p.exists():
+        raise RuntimeError(f"Файл не найден: {p}")
+
+    suffix = p.suffix.lower()
+
+    if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        from openpyxl import load_workbook
+        wb = load_workbook(p, data_only=True, read_only=True)
+
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+
+            header_idx = None
+            unit_col = None
+            cad_col = None
+
+            for i, row in enumerate(rows[:30]):
+                for c, val in enumerate(row):
+                    if unit_col is None and looks_like_unit_header(val):
+                        unit_col = c
+                    if cad_col is None and looks_like_cad_header(val):
+                        cad_col = c
+                if cad_col is not None or unit_col is not None:
+                    header_idx = i
+                    if cad_col is not None:
+                        break
+
+            start_row = (header_idx + 1) if header_idx is not None else 0
+
+            for row in rows[start_row:]:
+                values = [cell_text(v) for v in row]
+                if not any(values):
+                    continue
+
+                cad = ""
+                if cad_col is not None and cad_col < len(values):
+                    cad = find_cad(values[cad_col])
+                if not cad:
+                    cad = find_cad(" ".join(values))
+
+                unit_raw = ""
+                if unit_col is not None and unit_col < len(values):
+                    unit_raw = values[unit_col]
+                elif cad_col is not None:
+                    for i, value in enumerate(values):
+                        if i == cad_col:
+                            continue
+                        if is_real_unit(value):
+                            unit_raw = value
+                            break
+
+                unit = norm_unit(unit_raw) if is_real_unit(unit_raw) else ""
+
+                if cad:
+                    raw_rows.append({"cad": clean_cadastral_number(cad), "unit": unit})
+                elif unit:
+                    # Это реальная проблема: номер помещения указан, а КН нет.
+                    units_without_cad.append(unit)
+
+    else:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            cad = find_cad(line)
+            unit = ""
+            if cad:
+                rest = line.replace(cad, " ")
+                parts = [x.strip(" ,;|\t") for x in re.split(r"[;,\t|]+|\s{2,}", rest) if x.strip(" ,;|\t")]
+                for part in parts:
+                    if is_real_unit(part):
+                        unit = norm_unit(part)
+                        break
+                raw_rows.append({"cad": clean_cadastral_number(cad), "unit": unit})
+            else:
+                if is_real_unit(line):
+                    units_without_cad.append(norm_unit(line))
+
+    # Уникализируем по КН, чтобы строки собственников не раздували очередь.
+    by_cad: dict[str, dict[str, str]] = {}
+    duplicate_cads_source: set[str] = set()
+    for row in raw_rows:
+        cad = row.get("cad") or ""
+        unit = row.get("unit") or ""
+        if not cad:
+            continue
+        if cad in by_cad:
+            duplicate_cads_source.add(cad)
+            if not by_cad[cad].get("unit") and unit:
+                by_cad[cad]["unit"] = unit
+        else:
+            by_cad[cad] = {"cad": cad, "unit": unit}
+
+    queue_rows = list(by_cad.values())
+    cads = [r["cad"] for r in queue_rows if r.get("cad")]
+    units = [r["unit"] for r in queue_rows if r.get("unit")]
+
+    unit_to_cads: dict[str, set[str]] = {}
+    for row in queue_rows:
+        if row.get("unit") and row.get("cad"):
+            unit_to_cads.setdefault(row["unit"], set()).add(row["cad"])
+
+    units_with_multiple_cads = sorted(
+        [unit for unit, vals in unit_to_cads.items() if len(vals) > 1],
+        key=lambda x: (len(x), x),
+    )
+
+    missing_numeric_units: list[str] = []
+    numeric_units: list[int] = []
+    for u in set(units):
+        if re.fullmatch(r"\d+", str(u)):
+            try:
+                numeric_units.append(int(u))
+            except Exception:
+                pass
+    if len(numeric_units) >= 3:
+        lo, hi = min(numeric_units), max(numeric_units)
+        existing = set(numeric_units)
+        if 0 < hi - lo <= 1000:
+            missing_numeric_units = [str(x) for x in range(lo, hi + 1) if x not in existing]
+
+    lines: list[str] = []
+    lines.append("Проверка файла списка кадастровых номеров")
+    lines.append("")
+    lines.append(f"Файл: {p}")
+    lines.append("")
+    lines.append("Сводка:")
+    lines.append(f"- строк очереди к обработке: {len(queue_rows)}")
+    lines.append(f"- кадастровых номеров: {len(set(cads))}")
+
+    if units:
+        lines.append(f"- номеров помещений: {len(set(units))}")
+        lines.append("- распознанный формат: кадастровый номер + номер помещения")
+    else:
+        lines.append("- номеров помещений: не обнаружены")
+        lines.append("- распознанный формат: только кадастровые номера")
+        lines.append("  Это допустимо: парсер будет искать по КН. Номер помещения можно будет проверить или заполнить вручную при необходимости.")
+
+    lines.append("")
+
+    problems: list[tuple[str, str]] = []
+
+    if units_without_cad:
+        problems.append((
+            "Строки, где номер помещения есть, а КН пустой",
+            short_list(sorted(set(units_without_cad), key=lambda x: (len(x), x))),
+        ))
+
+    if units_with_multiple_cads:
+        details = []
+        for unit in units_with_multiple_cads[:40]:
+            vals = sorted(unit_to_cads.get(unit, set()))
+            details.append(f"{unit}: {', '.join(vals[:5])}" + (f" ... ещё {len(vals)-5}" if len(vals) > 5 else ""))
+        if len(units_with_multiple_cads) > 40:
+            details.append(f"... ещё {len(units_with_multiple_cads) - 40}")
+        problems.append(("Один номер помещения связан с несколькими КН", "\n  " + "\n  ".join(details)))
+
+    if missing_numeric_units:
+        problems.append((
+            f"В числовом диапазоне помещений {min(numeric_units)}–{max(numeric_units)} отсутствуют номера",
+            short_list(missing_numeric_units),
+        ))
+
+    lines.append("Проблемные моменты:")
+    if problems:
+        for title, body in problems:
+            lines.append(f"- {title}:")
+            lines.append(f"  {body}")
+    else:
+        lines.append("- Проблем не найдено.")
+
+    lines.append("")
+    lines.append("Для запуска режима нажмите «Включить режим списка КН», выберите итоговый Excel и нажмите «Старт».")
+
+    return "\n".join(lines)
 
 def merge_unit_lists(*lists: list[str]) -> list[str]:
     result: list[str] = []
@@ -2997,6 +3396,57 @@ def build_reconcile_validation_rows(ws, header_row: int, cols: dict[str, int | N
     return rows
 
 
+def stable_share_from_old_records(records: list[OldRegistryRecord]) -> str:
+    # Возвращает долю, если по группе старых записей есть ровно одна устойчивая
+    # непустая доля. Используется для спорных случаев: ФИО не переносим, но
+    # известную долю по сохранившемуся номеру права переносим.
+    shares: list[str] = []
+    seen: set[str] = set()
+    for rec in records or []:
+        share = str(getattr(rec, "share", "") or "").strip()
+        if not share or share == ".":
+            continue
+        key = normalize_text(share)
+        if key not in seen:
+            seen.add(key)
+            shares.append(share)
+    return shares[0] if len(shares) == 1 else ""
+
+
+def apply_stable_share_to_ambiguous_row(
+    ws,
+    header_row: int,
+    cols: dict[str, int | None],
+    row_idx: int,
+    flat: str,
+    reg_raw: str,
+    records: list[OldRegistryRecord],
+    transfer_shares: bool,
+    match_log: list[list[Any]],
+    note: str,
+) -> str:
+    # При неоднозначном ФИО переносит только устойчивую долю из старого реестра.
+    if not transfer_shares or not cols.get("share") or not records:
+        return ""
+
+    stable_share = stable_share_from_old_records(records)
+    if not stable_share:
+        return ""
+
+    if should_skip_old_share_override(ws, header_row, cols, row_idx, flat, stable_share, expanded=False):
+        current = ws.cell(row_idx, cols.get("share")).value if cols.get("share") else ""
+        msg = f"устойчивая доля {stable_share} не перенесена, сохранена доля Росреестра {current}"
+        match_log.append([row_idx, flat, reg_raw, "доля не перенесена", "неоднозначное ФИО", "", stable_share, f"{note}; {msg}"])
+        return msg
+
+    old_value = ws.cell(row_idx, cols.get("share")).value if cols.get("share") else ""
+    set_cell(ws, row_idx, cols.get("share"), stable_share)
+    sources = "; ".join(f"{r.source_file}/{r.sheet}/строка {r.row}" for r in records[:5])
+    msg = f"ФИО неоднозначны, но доля перенесена по совпавшему номеру права: {old_value} -> {stable_share}"
+    match_log.append([row_idx, flat, reg_raw, "доля перенесена", "неоднозначное ФИО, устойчивая доля", "", stable_share, f"{note}; {sources}"])
+    return msg
+
+
 def reconcile_registries(
     new_path: Path,
     old_path: Path | str | list[Path],
@@ -3186,9 +3636,23 @@ def reconcile_registries(
                             else:
                                 stats["ambiguous"] += 1
                                 reason = f"Старых записей по праву больше ({len(by_flat)}), чем строк Росреестра с этим правом ({len(same_new_rows)}); ФИО не перенесено автоматически"
+                                share_msg = apply_stable_share_to_ambiguous_row(
+                                    ws,
+                                    header_row,
+                                    cols,
+                                    row_idx,
+                                    flat,
+                                    reg_raw,
+                                    by_flat,
+                                    transfer_shares,
+                                    match_log,
+                                    reason,
+                                )
+                                if share_msg:
+                                    reason += f"; {share_msg}"
                                 ambiguous.append([row_idx, flat, reg_raw, "", reason, "; ".join(r.fio_original for r in by_flat)])
                                 highlight_reconcile_rows(ws, [row_idx], share_col=cols.get("share"), reason=reason)
-                                match_log.append([row_idx, flat, reg_raw, "не перенесено", "неоднозначно: старых ФИО больше, чем новых строк", "", "", "; ".join(r.fio_original for r in by_flat)])
+                                match_log.append([row_idx, flat, reg_raw, "не перенесено", "неоднозначно: старых ФИО больше, чем новых строк", "", stable_share_from_old_records(by_flat) if share_msg else "", "; ".join(r.fio_original for r in by_flat)])
                                 continue
                         if ordinal < len(by_flat):
                             chosen = [by_flat[ordinal]]
@@ -3207,6 +3671,21 @@ def reconcile_registries(
                 else:
                     stats["ambiguous"] += 1
                     reason = "Один номер права найден у нескольких ФИО, но не удалось однозначно привязать к помещению"
+                    share_records = by_flat if flat and by_flat else []
+                    share_msg = apply_stable_share_to_ambiguous_row(
+                        ws,
+                        header_row,
+                        cols,
+                        row_idx,
+                        flat,
+                        reg_raw,
+                        share_records,
+                        transfer_shares,
+                        match_log,
+                        reason,
+                    )
+                    if share_msg:
+                        reason += f"; {share_msg}"
                     ambiguous.append([row_idx, flat, reg_raw, "", reason, "; ".join(r.fio_original for r in records)])
                     highlight_reconcile_rows(ws, [row_idx], share_col=cols.get("share"), reason=reason)
                     continue
@@ -4351,6 +4830,9 @@ class ParserWorker(threading.Thread):
     def is_cadastral_mode(self) -> bool:
         return self.parser_mode() == "cadastral"
 
+    def is_cadastral_queue_mode(self) -> bool:
+        return self.parser_mode() == "cad_queue"
+
     def is_full_info_mode(self) -> bool:
         return self.parser_mode() == "full"
 
@@ -4402,9 +4884,14 @@ class ParserWorker(threading.Thread):
             slug = filename_slug(f"snt_{city}_{name}_{quarters}_{start_flat}-{end_flat}") or "snt"
             return base / "state" / f"progress_{slug}.json"
 
-        # Прогресс ОСС, полного режима и режима кадастровых номеров должен быть раздельным.
-        # Иначе запуск "Полные сведения" может отметить квартиры обработанными,
-        # а следующий запуск "Реестр для ОСС" пропустит их и сохранит пустой result.
+        # Прогресс ОСС, полного режима, режима кадастровых номеров и очереди КН должен быть раздельным.
+        # Иначе один режим может отметить квартиры обработанными, а другой режим пропустит их и сохранит пустой result.
+        if mode == "cad_queue":
+            queue_path = str(self.cfg.get("cadastral_queue_file_path") or "").strip()
+            source = Path(queue_path).stem if queue_path else (house_address_from_prefix(address_prefix) or address_prefix or "queue")
+            slug = filename_slug(f"cad_queue_{source}") or "cad_queue"
+            return base / "state" / f"progress_{slug}.json"
+
         house = house_address_from_prefix(address_prefix) or address_prefix or "house"
         mode_prefix = mode if mode in {"oss", "full", "cadastral"} else "oss"
         slug = filename_slug(f"{mode_prefix}_{house}_kv_{start_flat}-{end_flat}") or f"progress_{mode_prefix}"
@@ -4582,7 +5069,7 @@ class ParserWorker(threading.Thread):
             export_format = "snt"
         elif self.parser_mode() == "full":
             export_format = "full"
-        elif self.parser_mode() == "oss":
+        elif self.parser_mode() in {"oss", "cad_queue"}:
             export_format = str(self.cfg.get("oss_export_format") or "burmistr")
         else:
             export_format = "burmistr"
@@ -4667,6 +5154,19 @@ class ParserWorker(threading.Thread):
                     self.write_run_summary(address_prefix, start_flat, end_flat)
                 except Exception as e:
                     self.log(f"Не удалось выполнить сводку СНТ: {e}")
+                self.excel.save()
+                self.log(f"Готово: {self.excel.output_path}")
+                self.log(f"Лог-файл: {self.excel.log_path}") if self.excel.log_path else None
+            return
+
+        if self.is_cadastral_queue_mode():
+            self.process_cadastral_queue_mode()
+            if self.excel:
+                try:
+                    self.excel.validate_result()
+                    self.write_run_summary(address_prefix, start_flat, end_flat)
+                except Exception as e:
+                    self.log(f"Не удалось выполнить проверку/сводку режима списка КН: {e}")
                 self.excel.save()
                 self.log(f"Готово: {self.excel.output_path}")
                 self.log(f"Лог-файл: {self.excel.log_path}") if self.excel.log_path else None
@@ -4799,12 +5299,13 @@ class ParserWorker(threading.Thread):
                 "Дополнительные номера": str(self.cfg.get("extra_unit_numbers") or "").strip(),
                 "Ручная очередь": str(self.cfg.get("manual_unit_numbers") or "").strip(),
                 "Файл ручной очереди": str(self.cfg.get("manual_unit_file_path") or "").strip(),
+                "Файл списка кадастровых номеров": str(self.cfg.get("cadastral_queue_file_path") or "").strip(),
                 "Искать квартиры/помещения по диапазону": "да" if self.cfg.get("search_numbered_units") else "нет",
                 "Поиск помещений без номеров": "да" if self.cfg.get("include_unnumbered_house_objects") else "нет",
                 "Только собрать кадастровые номера": "да" if self.cfg.get("collect_cadastral_only") else "нет",
                 "Пресет пауз": self.cfg.get("pause_preset", ""),
             }
-            if self.parser_mode() == "oss":
+            if self.parser_mode() in {"oss", "cad_queue"}:
                 summary["Формат выгрузки ОСС"] = OSS_EXPORT_FORMAT_LABELS.get(str(self.cfg.get("oss_export_format") or "burmistr"), str(self.cfg.get("oss_export_format") or "burmistr"))
             summary.update(self.metrics)
         self.excel.write_summary(summary)
@@ -4819,15 +5320,27 @@ class ParserWorker(threading.Thread):
     def detect_rate_limit(self) -> bool:
         """Росреестр иногда показывает toast: превышен лимит обращений."""
         try:
+            if getattr(self, "visible_cadastral_rows_count", None) and self.visible_cadastral_rows_count() > 0:
+                try:
+                    self.close_rosreestr_notifications()
+                except Exception:
+                    pass
+                return False
             text = self.page.inner_text("body", timeout=3000) if self.page else ""
         except Exception:
             return False
         t = normalize_text(text)
-        return (
+        found = (
             "превышен лимит обращений" in t
-            or "попробуйте позже" in t and "список объектов" in t
+            or ("попробуйте позже" in t and "список объектов" in t)
             or "не удалось получить список объектов недвижимости" in t
         )
+        if found:
+            try:
+                self.close_rosreestr_notifications()
+            except Exception:
+                pass
+        return found
 
     def is_login_page(self) -> bool:
         """Понимаем, что сайт вернул на авторизацию. Это не ошибка: ждём пользователя."""
@@ -5375,6 +5888,562 @@ class ParserWorker(threading.Thread):
                 self.excel.append_snt_not_found(str(plot_no), search_addresses[0] if search_addresses else str(plot_no), reason)
             self.log(f"  СНТ: участок {plot_no} не найден/не записан.")
 
+
+    def process_cadastral_queue_mode(self) -> None:
+        assert self.page is not None
+        assert self.excel is not None
+        queue_path = str(self.cfg.get("cadastral_queue_file_path") or "").strip()
+        items = read_cadastral_queue_from_file(queue_path)
+        self.metrics["Заданий всего"] = len(items)
+        self.log(f"Режим списка кадастровых номеров: найдено {len(items)} уникальных КН в файле.")
+        if not items:
+            self.log("Очередь КН пустая. Проверьте Excel: нужна колонка с кадастровыми номерами.")
+            return
+        self.log(cadastral_queue_preview_text(queue_path, max_items=12))
+
+        for idx, item in enumerate(items, start=1):
+            if not self.wait_control():
+                break
+            cad = item.cadastral_number
+            if bool(self.cfg.get("resume_enabled", True)) and bool(self.cfg.get("skip_done_cadastrals", True)) and cad in getattr(self, "processed_cadastrals", set()):
+                self.metrics["Пропущено как уже обработанные"] = self.metrics.get("Пропущено как уже обработанные", 0) + 1
+                self.log(f"[{idx}/{len(items)}] Пропуск КН {cad}: уже обработан по файлу прогресса.")
+                continue
+            self.log(f"[{idx}/{len(items)}] Ищу по КН {cad}; помещение: {item.unit_no or '.'}")
+            try:
+                self.process_cadastral_queue_item(item)
+            except Exception:
+                self.metrics["Ошибок"] = self.metrics.get("Ошибок", 0) + 1
+                self.log(f"Ошибка по КН {cad}:\n{traceback.format_exc()}")
+                self.excel.append_error(item.unit_no or ".", cad, "Ошибка", "Исключение при обработке КН. Подробности в логе.", cad, "")
+            if not self.stop_event.is_set():
+                self.processed_cadastrals.add(cad)
+                self.save_progress_state()
+            if self.excel and self.cfg.get("save_after_each_flat", True):
+                self.excel.save()
+            self.human_delay()
+
+    def wait_cadastral_queue_search_settled(self, target_cad: str, timeout_seconds: float = 35.0) -> None:
+        # Дополнительная страховка именно для режима списка КН.
+        # Для точного КН ждём появления нужного кадастрового номера или стабильного отсутствия результатов.
+        assert self.page is not None
+        deadline = time.time() + float(timeout_seconds)
+        zero_seen_at: float | None = None
+
+        loading_markers = [
+            "идет загрузка списка объектов",
+            "идёт загрузка списка объектов",
+            "подождите идет загрузка",
+            "подождите идёт загрузка",
+            "загрузка списка объектов недвижимости",
+        ]
+        zero_markers = [
+            "найдено результатов: 0",
+            "найдено результатов 0",
+            "по заданным критериям поиска объекты не найдены",
+            "объекты не найдены",
+        ]
+
+        while time.time() < deadline:
+            if self.detect_rate_limit():
+                raise RateLimitError("Превышен лимит обращений Росреестра")
+            try:
+                body_text = self.page.inner_text("body", timeout=3000)
+            except Exception:
+                body_text = ""
+            body_norm = normalize_text(body_text)
+
+            if target_cad and target_cad in body_text:
+                return
+            if "сведения об объекте" in body_norm or "общая информация" in body_norm or "статус объекта" in body_norm:
+                return
+
+            loading = any(marker in body_norm for marker in loading_markers)
+            if loading:
+                zero_seen_at = None
+                self.page.wait_for_timeout(500)
+                continue
+
+            if any(marker in body_norm for marker in zero_markers):
+                if zero_seen_at is None:
+                    zero_seen_at = time.time()
+                # Для режима точного КН ждём дольше, чем в общем wait_results.
+                if time.time() - zero_seen_at >= 12:
+                    return
+                self.page.wait_for_timeout(500)
+                continue
+
+            zero_seen_at = None
+            self.page.wait_for_timeout(500)
+
+    def collect_cadastral_queue_candidates(self, item: CadastralQueueItem) -> list[dict[str, Any]]:
+        assert self.page is not None
+        target = item.cadastral_number
+        self.wait_cadastral_queue_search_settled(target)
+        rows = self.page.evaluate(
+            r"""
+            () => {
+                const selectors = ['table tbody tr', 'tr', '[role=row]', '.table-row', '.results-row'];
+                const found = [];
+                const seen = new Set();
+                for (const sel of selectors) {
+                    for (const row of Array.from(document.querySelectorAll(sel))) {
+                        const text = (row.innerText || '').trim();
+                        if (!text || seen.has(text)) continue;
+                        seen.add(text);
+                        const rect = row.getBoundingClientRect();
+                        if (rect.height <= 0 || rect.width <= 0) continue;
+                        const cad = text.match(/\b\d{2}:\d{2}:\d{3,}:\d+\b/);
+                        if (!cad) continue;
+                        found.push({text, cad: cad[0]});
+                    }
+                }
+                return found;
+            }
+            """
+        )
+        candidates: list[dict[str, Any]] = []
+        self.log(f"  Строк в выдаче с кадастровыми номерами: {len(rows)}")
+        for row in rows:
+            text = row.get("text") or ""
+            cad = clean_cadastral_number(row.get("cad") or text)
+            if cad == target:
+                row["cad"] = cad
+                row["priority"] = 0
+                row["row_no"] = len(candidates)
+                candidates.append(row)
+                self.excel.append_search_result(target, item.unit_no or ".", cad, text, "Принят к открытию", "кадастровый номер совпал точно")
+                self.log(f"    [кандидат КН] {cad} | {text[:180]}")
+            else:
+                self.excel.append_search_result(target, item.unit_no or ".", cad, text, "Отклонён", "кадастровый номер не совпал с очередью")
+        return candidates
+
+    def cad_queue_replacement_search_queries(self, redeemed_info: ObjectInfo, item: CadastralQueueItem) -> list[str]:
+        # Строит несколько поисковых запросов для поиска актуальной замены погашенного КН.
+        queries: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: Any) -> None:
+            q = re.sub(r"\s+", " ", str(value or "").strip(" ,;"))
+            if not q:
+                return
+            key = normalize_text(q)
+            if key and key not in seen:
+                seen.add(key)
+                queries.append(q)
+
+        unit_no = clean_unit_number(item.unit_no or redeemed_info.flat_no or "")
+        raw_address = str(redeemed_info.address or "").strip()
+        add(raw_address)
+
+        cfg_prefix = str(self.cfg.get("address_prefix") or "").strip()
+        if unit_no and cfg_prefix:
+            add(f"{cfg_prefix} {unit_no}")
+            if not re.search(r"(?i)\b(кв|квартира|пом|помещение)\b", cfg_prefix):
+                add(f"{cfg_prefix} кв {unit_no}")
+                add(f"{cfg_prefix} квартира {unit_no}")
+
+        if raw_address and unit_no:
+            base = re.sub(r"(?i)(,?\s*(кв\.?|квартира|пом\.?|помещение)\s*№?\s*" + re.escape(unit_no) + r"\s*)$", "", raw_address).strip(" ,;")
+            if base and base != raw_address:
+                add(f"{base}, кв. {unit_no}")
+                add(f"{base}, квартира {unit_no}")
+
+        return queries
+
+    def collect_visible_cadastral_rows_for_replacement(self) -> list[dict[str, Any]]:
+        assert self.page is not None
+        rows = self.page.evaluate(
+            r"""
+            () => {
+                const selectors = ['table tbody tr', 'tr', '[role=row]', '.table-row', '.results-row'];
+                const found = [];
+                const seen = new Set();
+                for (const sel of selectors) {
+                    for (const row of Array.from(document.querySelectorAll(sel))) {
+                        const text = (row.innerText || '').trim();
+                        if (!text || seen.has(text)) continue;
+                        seen.add(text);
+                        const rect = row.getBoundingClientRect();
+                        if (rect.height <= 0 || rect.width <= 0) continue;
+                        const cad = text.match(/\b\d{2}:\d{2}:\d{3,}:\d+\b/);
+                        if (!cad) continue;
+                        found.push({text, cad: cad[0]});
+                    }
+                }
+                return found;
+            }
+            """
+        )
+        return rows if isinstance(rows, list) else []
+
+    def cad_queue_row_matches_unit_soft(self, row_text: str, unit_no: str, reference_address: str = "") -> tuple[bool, str, int]:
+        # Мягко проверяет, похожа ли строка выдачи на нужную квартиру.
+        # Возвращает: ok, reason, priority. Чем меньше priority, тем раньше кандидат открывается.
+        unit = clean_unit_number(unit_no)
+        text = str(row_text or "")
+        priority = 0
+
+        if unit:
+            found_flat = clean_unit_number(extract_flat_no(text) or "")
+            if found_flat:
+                if found_flat != unit:
+                    return False, f"номер помещения не совпал: найден {found_flat}, нужен {unit}", 999
+            else:
+                priority += 30
+
+        expected_house_source = house_address_from_prefix(str(self.cfg.get("address_prefix") or "")) or reference_address
+        expected_house = extract_house_no(expected_house_source)
+        row_house = extract_house_no(text)
+
+        if expected_house and row_house and expected_house != row_house:
+            return False, f"номер дома не совпал: найден {row_house}, нужен {expected_house}", 999
+        if expected_house and not row_house:
+            priority += 10
+
+        if expected_house_source:
+            try:
+                if not street_matches(expected_house_source, text, strict=False):
+                    priority += 20
+            except Exception:
+                priority += 20
+            try:
+                if not settlement_matches(expected_house_source, text):
+                    priority += 20
+            except Exception:
+                priority += 20
+
+        return True, "похожий адрес/номер помещения", priority
+
+    def collect_redeemed_replacement_candidates(self, search_query: str, unit_no: str, old_cad: str, reference_address: str = "") -> list[dict[str, Any]]:
+        assert self.page is not None
+        rows = self.collect_visible_cadastral_rows_for_replacement()
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        self.log(f"  Замена погашенного КН: строк в выдаче по адресу: {len(rows)}")
+
+        for row in rows:
+            text = row.get("text") or ""
+            cad = clean_cadastral_number(row.get("cad") or text)
+            if not cad:
+                continue
+            if cad == old_cad:
+                if self.excel:
+                    self.excel.append_search_result(search_query, unit_no or ".", cad, text, "Отклонён", "это исходный погашенный КН")
+                continue
+            if cad in seen:
+                continue
+
+            ok, reason, priority = self.cad_queue_row_matches_unit_soft(text, unit_no, reference_address)
+            if not ok:
+                if self.excel:
+                    self.excel.append_search_result(search_query, unit_no or ".", cad, text, "Отклонён", reason)
+                continue
+
+            seen.add(cad)
+            row["cad"] = cad
+            row["priority"] = priority
+            row["row_no"] = len(candidates)
+            candidates.append(row)
+            if self.excel:
+                self.excel.append_search_result(search_query, unit_no or ".", cad, text, "Кандидат замены", reason)
+            self.log(f"    [кандидат замены] {cad} p={priority} | {text[:180]}")
+
+        candidates.sort(key=lambda r: (int(r.get("priority", 99)), len(str(r.get("text") or ""))))
+        return candidates
+
+    def cad_queue_address_soft_match(self, actual_address: str, unit_no: str = "") -> tuple[bool, str]:
+        # Мягкая проверка адреса для режима поиска по точному КН.
+        actual = str(actual_address or "")
+        expected = house_address_from_prefix(str(self.cfg.get("address_prefix") or "")) or str(self.cfg.get("address_prefix") or "")
+        unit = clean_unit_number(unit_no)
+
+        if not expected or not actual:
+            return True, "нет адреса для строгой проверки"
+
+        if unit:
+            actual_flat = clean_unit_number(extract_flat_no(actual) or "")
+            if actual_flat and actual_flat != unit:
+                return False, f"номер помещения в карточке {actual_flat}, ожидался {unit}"
+
+        expected_house = extract_house_no(expected)
+        actual_house = extract_house_no(actual)
+        if expected_house and actual_house and expected_house != actual_house:
+            return False, f"номер дома в карточке {actual_house}, ожидался {expected_house}"
+
+        try:
+            if not street_matches(expected, actual, strict=False):
+                return False, "улица в карточке не похожа на адрес дома"
+        except Exception:
+            pass
+
+        expected_n = normalize_text(expected)
+        actual_n = normalize_text(actual)
+        if "ставропол" in expected_n and "ставропол" not in actual_n:
+            return False, "населённый пункт в карточке не похож на адрес дома"
+
+        return True, "адрес похож"
+
+    def find_actual_replacement_for_redeemed_cad_queue(self, redeemed_info: ObjectInfo, item: CadastralQueueItem, original_search_query: str) -> ObjectInfo | None:
+        # Когда исходный КН из старого реестра погашен, ищем актуальный объект
+        # по адресу из погашенной карточки и по адресу дома + номеру помещения.
+        assert self.page is not None
+        unit_no = item.unit_no or redeemed_info.flat_no or "."
+        old_cad = clean_cadastral_number(item.cadastral_number or "")
+        reference_address = str(redeemed_info.address or "").strip()
+
+        if not reference_address and not str(self.cfg.get("address_prefix") or "").strip():
+            self.log(f"  Погашенный КН {old_cad}: нет адреса для поиска актуальной замены.")
+            return None
+
+        queries = self.cad_queue_replacement_search_queries(redeemed_info, item)
+        if not queries:
+            self.log(f"  Погашенный КН {old_cad}: не удалось построить запросы для поиска актуальной замены.")
+            return None
+
+        opened_cads: set[str] = set()
+
+        for query_idx, query in enumerate(queries, start=1):
+            if not self.wait_control():
+                return None
+
+            self.log(f"  Погашенный КН {old_cad}: поиск актуальной замены {query_idx}/{len(queries)}: {query}")
+
+            try:
+                self.open_service_page()
+                self.fill_search_address(query)
+                self.click_find()
+                self.wait_results()
+                if self.detect_captcha():
+                    if not self.wait_manual_continue("Появилась капча. Введите её вручную в браузере."):
+                        return None
+                    self.click_find()
+                    self.wait_results()
+
+                candidates = self.collect_redeemed_replacement_candidates(query, unit_no, old_cad, reference_address)
+                if not candidates:
+                    self.log(f"  Погашенный КН {old_cad}: по запросу не найдено кандидатов актуальной замены.")
+                    continue
+
+                for candidate in candidates:
+                    cand_cad = clean_cadastral_number(candidate.get("cad") or "")
+                    if not cand_cad or cand_cad in opened_cads:
+                        continue
+                    opened_cads.add(cand_cad)
+
+                    info = self.open_candidate_and_parse(candidate, unit_no or ".", query)
+                    if not info:
+                        continue
+
+                    info.flat_no = unit_no or info.flat_no or "."
+                    info_cad = clean_cadastral_number(info.cadastral_number or cand_cad)
+
+                    if info_cad == old_cad:
+                        try:
+                            self.back_to_results()
+                        except Exception:
+                            pass
+                        continue
+
+                    if "погаш" in normalize_text(info.status):
+                        self.log(f"  Погашенный КН {old_cad}: кандидат {info.cadastral_number or cand_cad} тоже погашен, пропускаю.")
+                        try:
+                            self.back_to_results()
+                        except Exception:
+                            pass
+                        continue
+
+                    if is_building_or_land(info.object_type):
+                        self.log(f"  Погашенный КН {old_cad}: кандидат {info.cadastral_number or cand_cad} не помещение ({info.object_type}), пропускаю.")
+                        try:
+                            self.back_to_results()
+                        except Exception:
+                            pass
+                        continue
+
+                    addr_ok, addr_reason = self.cad_queue_address_soft_match(info.address or "", unit_no)
+                    if not addr_ok:
+                        self.log(f"  Погашенный КН {old_cad}: кандидат {info.cadastral_number or cand_cad} отклонён после открытия: {addr_reason}.")
+                        try:
+                            self.back_to_results()
+                        except Exception:
+                            pass
+                        continue
+
+                    if not info.cadastral_number or info.cadastral_number == ".":
+                        info.cadastral_number = cand_cad or "."
+
+                    self.log(f"  Погашенный КН {old_cad}: найдена актуальная замена {info.cadastral_number} для помещения {unit_no}.")
+                    return info
+
+            except RateLimitError:
+                raise
+            except StopRequested:
+                raise
+            except Exception as e:
+                self.log(f"  Погашенный КН {old_cad}: запрос замены не удался: {e}")
+
+        self.log(f"  Погашенный КН {old_cad}: актуальная замена не найдена после {len(queries)} запросов.")
+        return None
+
+    def _write_cadastral_queue_info(self, info: ObjectInfo, item: CadastralQueueItem, search_query: str) -> bool:
+        assert self.excel is not None
+        info.flat_no = item.unit_no or info.flat_no or "."
+        if not info.cadastral_number or info.cadastral_number == ".":
+            info.cadastral_number = item.cadastral_number
+
+        opened_cad = clean_cadastral_number(info.cadastral_number or "")
+        original_cad = clean_cadastral_number(item.cadastral_number or "")
+        search_cad = clean_cadastral_number(search_query or "")
+        allowed_cads = {c for c in [original_cad, search_cad] if c}
+        if opened_cad and allowed_cads and opened_cad not in allowed_cads:
+            self.excel.append_error(item.unit_no or ".", search_query, "Ошибка", f"Открылась карточка другого КН: {info.cadastral_number}", item.cadastral_number, info.address)
+            return False
+
+        if "погаш" in normalize_text(info.status):
+            self.metrics["Погашенных"] = self.metrics.get("Погашенных", 0) + 1
+
+            replacement = self.find_actual_replacement_for_redeemed_cad_queue(info, item, search_query)
+            if replacement is not None:
+                new_cad = clean_cadastral_number(replacement.cadastral_number or "") or replacement.cadastral_number or "."
+                self.metrics["Актуальных замен погашенным КН"] = self.metrics.get("Актуальных замен погашенным КН", 0) + 1
+                try:
+                    self.excel.append_disputed(
+                        search_query,
+                        item.unit_no or ".",
+                        item.cadastral_number,
+                        replacement.address or info.address or ".",
+                        "Погашенный КН заменён актуальным",
+                        f"Исходный КН {item.cadastral_number} погашен; по адресу погашенной карточки найден актуальный КН {new_cad}.",
+                        str(new_cad),
+                    )
+                except Exception:
+                    pass
+                return self._write_cadastral_queue_info(replacement, item, str(new_cad))
+
+            self.metrics["Погашенных записано в реестр"] = self.metrics.get("Погашенных записано в реестр", 0) + 1
+            try:
+                self.excel.append_disputed(
+                    search_query,
+                    item.unit_no or ".",
+                    item.cadastral_number,
+                    info.address or ".",
+                    "Погашенный объект записан",
+                    "Исходный КН погашен, актуальная замена по адресу не найдена. Объект записан в реестр, чтобы помещение не исчезло из списка; проверьте вручную.",
+                    item.cadastral_number,
+                )
+                self.excel.append_error(
+                    item.unit_no or ".",
+                    search_query,
+                    "Погашенный записан",
+                    "Объект найден по КН, но статус погашенный; актуальная замена по адресу не найдена, поэтому погашенный объект записан в основной реестр для сохранения помещения в списке.",
+                    item.cadastral_number,
+                    info.address,
+                )
+            except Exception:
+                pass
+
+            self.write_object_rows(info)
+            self.metrics["Найдено помещений/квартир"] = self.metrics.get("Найдено помещений/квартир", 0) + 1
+            return True
+
+        if bool(self.cfg.get("cadastral_queue_validate_address", True)):
+            addr_ok, addr_reason = self.cad_queue_address_soft_match(info.address or "", item.unit_no or info.flat_no or "")
+            if not addr_ok:
+                self.metrics["Спорных результатов"] = self.metrics.get("Спорных результатов", 0) + 1
+                self.excel.append_disputed(
+                    search_query,
+                    item.unit_no or ".",
+                    info.cadastral_number or item.cadastral_number,
+                    info.address,
+                    "Записан по точному КН",
+                    f"Адрес карточки не похож на адрес дома из поля «Адрес до номера»: {addr_reason}. Проверьте вручную.",
+                    info.cadastral_number or item.cadastral_number,
+                )
+
+        if is_building_or_land(info.object_type):
+            self.metrics["Зданий/участков"] = self.metrics.get("Зданий/участков", 0) + 1
+            self.excel.append_building_land(info, source=f"Найдено при поиске по списку КН: помещение {item.unit_no or '.'}, КН {item.cadastral_number}")
+            self.excel.append_error(item.unit_no or ".", search_query, "Не помещение", "По КН найден объект типа здание/земельный участок; перенесён на служебный лист", item.cadastral_number, info.address)
+            return False
+
+        self.write_object_rows(info)
+        self.metrics["Найдено помещений/квартир"] = self.metrics.get("Найдено помещений/квартир", 0) + 1
+        return True
+
+    def process_cadastral_queue_item(self, item: CadastralQueueItem) -> None:
+        assert self.page is not None
+        assert self.excel is not None
+        retry_count = int(self.cfg.get("retry_count") or 3)
+        rate_limit_retry_count = int(self.cfg.get("rate_limit_retry_count") or 12)
+        rate_limit_hits = 0
+        attempt = 1
+        search_query = item.cadastral_number
+
+        while attempt <= retry_count:
+            if not self.wait_control():
+                return
+            try:
+                self.open_service_page()
+                self.fill_search_address(search_query)
+                self.click_find()
+                self.wait_results()
+                if self.detect_captcha():
+                    if not self.wait_manual_continue("Появилась капча. Введите её вручную в браузере."):
+                        return
+                    self.click_find()
+                    self.wait_results()
+
+                try:
+                    body_text = self.page.inner_text("body", timeout=10000)
+                except Exception:
+                    body_text = ""
+                body_norm = normalize_text(body_text)
+                if search_query in body_text and ("сведения об объекте" in body_norm or "общая информация" in body_norm or "статус объекта" in body_norm):
+                    info = parse_card_text(body_text, item.unit_no or ".", search_query)
+                    self._write_cadastral_queue_info(info, item, search_query)
+                    return
+
+                candidates = self.collect_cadastral_queue_candidates(item)
+                if not candidates:
+                    self.metrics["Не найдено"] = self.metrics.get("Не найдено", 0) + 1
+                    self.excel.append_error(item.unit_no or ".", search_query, "Не найдено", "В выдаче нет точного совпадения кадастрового номера", item.cadastral_number, "")
+                    return
+
+                for candidate in candidates:
+                    info = self.open_candidate_and_parse(candidate, item.unit_no or ".", search_query)
+                    if not info:
+                        continue
+                    if self._write_cadastral_queue_info(info, item, search_query):
+                        return
+                    try:
+                        self.back_to_results()
+                    except Exception:
+                        pass
+                return
+            except RateLimitError as e:
+                rate_limit_hits += 1
+                if rate_limit_hits > rate_limit_retry_count:
+                    self.metrics["Лимитов Росреестра"] = self.metrics.get("Лимитов Росреестра", 0) + 1
+                    self.excel.append_error(item.unit_no or ".", search_query, "Лимит", f"Лимит обращений после {rate_limit_retry_count} ожиданий: {e}", item.cadastral_number, "")
+                    return
+                pause = float(self.cfg.get("rate_limit_pause_seconds") or 300)
+                self.log(f"  Росреестр сообщил о лимите обращений. Жду {int(pause)} сек. и повторяю этот КН ({rate_limit_hits}/{rate_limit_retry_count}).")
+                if not self.controlled_sleep(pause, reason="Ожидание лимита Росреестра"):
+                    return
+                continue
+            except StopRequested:
+                raise
+            except Exception as e:
+                self.log(f"  КН {search_query}: попытка {attempt}/{retry_count} не удалась: {e}")
+                if attempt < retry_count:
+                    self.controlled_sleep(float(self.cfg.get("retry_delay_seconds") or 10))
+                else:
+                    self.metrics["Ошибок"] = self.metrics.get("Ошибок", 0) + 1
+                    self.excel.append_error(item.unit_no or ".", search_query, "Ошибка", f"Ошибка после {retry_count} попыток: {e}", item.cadastral_number, "")
+                    return
+                attempt += 1
+
     def process_flat(self, flat_no: str, search_addresses: str | list[str]) -> None:
         assert self.page is not None
         assert self.excel is not None
@@ -5590,6 +6659,7 @@ class ParserWorker(threading.Thread):
         self.page.wait_for_timeout(1200)
         if self.detect_rate_limit():
             raise RateLimitError("Превышен лимит обращений Росреестра")
+
         try:
             self.page.wait_for_function(
                 """
@@ -5599,7 +6669,11 @@ class ParserWorker(threading.Thread):
                         || t.includes('не удалось получить список объектов недвижимости')
                         || t.includes('найдено результатов')
                         || t.includes('не найдено')
-                        || t.includes('сведения об объекте');
+                        || t.includes('сведения об объекте')
+                        || t.includes('идет загрузка списка объектов')
+                        || t.includes('идёт загрузка списка объектов')
+                        || t.includes('подождите, идет загрузка')
+                        || t.includes('подождите, идёт загрузка');
                 }
                 """,
                 timeout=45000,
@@ -5607,6 +6681,93 @@ class ParserWorker(threading.Thread):
         except Exception:
             # Некоторые версии сайта не пишут явный статус, ждём таблицу.
             self.page.wait_for_timeout(3000)
+
+        def visible_cadastral_rows_count() -> int:
+            try:
+                return int(self.page.evaluate(
+                    r"""
+                    () => {
+                        const selectors = ['table tbody tr', 'tr', '[role=row]', '.table-row', '.results-row'];
+                        const seen = new Set();
+                        let count = 0;
+                        for (const sel of selectors) {
+                            for (const row of Array.from(document.querySelectorAll(sel))) {
+                                const text = (row.innerText || '').trim();
+                                if (!text || seen.has(text)) continue;
+                                seen.add(text);
+                                const rect = row.getBoundingClientRect();
+                                if (rect.height <= 0 || rect.width <= 0) continue;
+                                if (/\b\d{2}:\d{2}:\d{3,}:\d+\b/.test(text)) count += 1;
+                            }
+                        }
+                        return count;
+                    }
+                    """
+                ) or 0)
+            except Exception:
+                return 0
+
+        loading_markers = [
+            "идет загрузка списка объектов",
+            "идёт загрузка списка объектов",
+            "подождите идет загрузка",
+            "подождите идёт загрузка",
+            "загрузка списка объектов недвижимости",
+        ]
+        zero_markers = [
+            "найдено результатов: 0",
+            "найдено результатов 0",
+            "по заданным критериям поиска объекты не найдены",
+            "объекты не найдены",
+        ]
+
+        # Важная защита: сайт может сначала показать "0 результатов",
+        # а потом только догрузить таблицу. Ноль принимаем только если он
+        # стабильно держится несколько секунд и нет признака загрузки.
+        deadline = time.time() + 45
+        zero_seen_at: float | None = None
+        ready_seen = 0
+
+        while time.time() < deadline:
+            if self.detect_rate_limit():
+                raise RateLimitError("Превышен лимит обращений Росреестра")
+
+            try:
+                body_text = self.page.inner_text("body", timeout=3000)
+            except Exception:
+                body_text = ""
+            body_norm = normalize_text(body_text)
+            rows_count = visible_cadastral_rows_count()
+            loading = any(marker in body_norm for marker in loading_markers)
+
+            if loading:
+                zero_seen_at = None
+                ready_seen = 0
+                self.page.wait_for_timeout(500)
+                continue
+
+            if rows_count > 0 or "сведения об объекте" in body_norm or "общая информация" in body_norm or "статус объекта" in body_norm:
+                ready_seen += 1
+                if ready_seen >= 2:
+                    return
+                self.page.wait_for_timeout(500)
+                continue
+
+            if any(marker in body_norm for marker in zero_markers):
+                if zero_seen_at is None:
+                    zero_seen_at = time.time()
+                # Не верим мгновенному "0": ждём, вдруг таблица ещё догружается.
+                if time.time() - zero_seen_at >= 8:
+                    return
+                self.page.wait_for_timeout(500)
+                continue
+
+            zero_seen_at = None
+            ready_seen = 0
+            self.page.wait_for_timeout(500)
+
+        # Не падаем: если сайт не дал явного состояния, дальше collect_candidates
+        # сам увидит пустую выдачу или найденные строки.
         if self.detect_rate_limit():
             raise RateLimitError("Превышен лимит обращений Росреестра")
 
@@ -5671,42 +6832,138 @@ class ParserWorker(threading.Thread):
             self.log(f"  Очередь открытия результатов: {preview}")
         return candidates
 
+    def card_details_visible(self) -> bool:
+        assert self.page is not None
+        try:
+            text = normalize_text(self.page.inner_text("body", timeout=2500))
+        except Exception:
+            return False
+        return (
+            "сведения об объекте" in text
+            or "общая информация" in text
+            or "статус объекта" in text
+        )
+
+    def wait_candidate_card_opened(self, cad: str, timeout_ms: int = 7000) -> bool:
+        assert self.page is not None
+        deadline = time.time() + max(1.0, float(timeout_ms) / 1000.0)
+        while time.time() < deadline:
+            try:
+                self.close_rosreestr_notifications()
+            except Exception:
+                pass
+            if self.detect_captcha():
+                if not self.wait_manual_continue("Появилась капча при открытии объекта. Введите её вручную."):
+                    return False
+            try:
+                if self.context is not None:
+                    for p in list(self.context.pages):
+                        try:
+                            txt = normalize_text(p.inner_text("body", timeout=1000))
+                        except Exception:
+                            continue
+                        if "сведения об объекте" in txt or "общая информация" in txt or "статус объекта" in txt:
+                            self.page = p
+                            return True
+            except Exception:
+                pass
+            if self.card_details_visible():
+                return True
+            try:
+                self.page.wait_for_timeout(300)
+            except Exception:
+                time.sleep(0.3)
+        return False
+
     def open_candidate_and_parse(self, candidate: dict[str, Any], flat_no: str, search_address: str = "") -> ObjectInfo | None:
         assert self.page is not None
         cad = candidate.get("cad") or ""
-        for attempt in range(1, int(self.cfg.get("retry_count") or 3) + 1):
+        retry_total = int(self.cfg.get("retry_count") or 3)
+
+        for attempt in range(1, retry_total + 1):
             try:
-                # После возврата назад сайт иногда теряет таблицу результатов.
-                # Перед кликом по следующему КН убеждаемся, что нужная строка снова есть на странице.
-                if cad and cad not in (self.page.inner_text("body", timeout=5000) or ""):
+                try:
+                    body_now = self.page.inner_text("body", timeout=4000) or ""
+                except Exception:
+                    body_now = ""
+
+                if cad and cad not in body_now:
                     self.open_service_page()
                     if search_address:
                         self.fill_search_address(search_address)
                         self.click_find()
                         self.wait_results()
-                self.click_candidate(cad)
-                self.page.wait_for_function(
-                    """
-                    () => {
-                        const t = document.body.innerText.toLowerCase();
-                        return t.includes('сведения об объекте') || t.includes('общая информация') || t.includes('статус объекта');
-                    }
-                    """,
-                    timeout=45000,
-                )
+                        if hasattr(self, "wait_cadastral_queue_search_settled"):
+                            try:
+                                self.wait_cadastral_queue_search_settled(cad, timeout_seconds=20)
+                            except TypeError:
+                                self.wait_cadastral_queue_search_settled(cad)
+
+                opened = False
+                click_errors: list[str] = []
+                for click_try in range(1, 4):
+                    try:
+                        self.close_rosreestr_notifications()
+                    except Exception:
+                        pass
+                    try:
+                        self.click_candidate(cad)
+                    except Exception as click_error:
+                        click_errors.append(str(click_error))
+
+                    if self.wait_candidate_card_opened(cad, timeout_ms=7000):
+                        opened = True
+                        break
+
+                    self.log(f"  Карточка {cad}: клик {click_try}/3 не открыл карточку за 7 сек., пробую ещё раз.")
+
+                    try:
+                        body_after = self.page.inner_text("body", timeout=3000) or ""
+                    except Exception:
+                        body_after = ""
+                    if cad not in body_after and not self.card_details_visible():
+                        try:
+                            self.back_to_results()
+                        except Exception:
+                            pass
+                        try:
+                            body_after = self.page.inner_text("body", timeout=3000) or ""
+                        except Exception:
+                            body_after = ""
+                        if cad not in body_after:
+                            self.open_service_page()
+                            if search_address:
+                                self.fill_search_address(search_address)
+                                self.click_find()
+                                self.wait_results()
+                                if hasattr(self, "wait_cadastral_queue_search_settled"):
+                                    try:
+                                        self.wait_cadastral_queue_search_settled(cad, timeout_seconds=20)
+                                    except TypeError:
+                                        self.wait_cadastral_queue_search_settled(cad)
+
+                if not opened:
+                    details = "; ".join(click_errors[-3:]) if click_errors else "клик выполнен, но карточка не открылась"
+                    raise RuntimeError(f"Не удалось открыть карточку {cad}: {details}")
+
                 if self.detect_captcha():
                     if not self.wait_manual_continue("Появилась капча при открытии объекта. Введите её вручную."):
                         return None
+
                 text = self.page.inner_text("body", timeout=10000)
                 info = parse_card_text(text, flat_no, cad)
                 if not re.fullmatch(r"\d{2}:\d{2}:\d{3,}:\d+", info.cadastral_number or ""):
                     info.cadastral_number = cad or "."
                 return info
+
             except Exception as e:
-                self.log(f"  Карточка {cad}: попытка {attempt} не удалась: {e}")
-                if attempt < int(self.cfg.get("retry_count") or 3):
-                    self.controlled_sleep(float(self.cfg.get("retry_delay_seconds") or 10))
-                    self.back_to_results()
+                self.log(f"  Карточка {cad}: попытка {attempt}/{retry_total} не удалась: {e}")
+                if attempt < retry_total:
+                    self.controlled_sleep(min(float(self.cfg.get("retry_delay_seconds") or 10), 5.0))
+                    try:
+                        self.back_to_results()
+                    except Exception:
+                        pass
                 else:
                     return None
         return None
@@ -5715,47 +6972,56 @@ class ParserWorker(threading.Thread):
         assert self.page is not None
         if not cad:
             raise RuntimeError("Пустой кадастровый номер результата")
-
-        # Сначала кликаем через DOM: так надёжнее при таблицах/SPA, чем get_by_text.
-        clicked = self.page.evaluate(
-            """
-            (cad) => {
-                function visible(el) {
-                    const r = el.getBoundingClientRect();
-                    const st = window.getComputedStyle(el);
-                    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
-                }
-                const nodes = Array.from(document.querySelectorAll('a, button, td, span, div, tr, [role=button]'))
-                    .filter(n => visible(n) && (n.innerText || '').includes(cad));
-                if (!nodes.length) return false;
-
-                nodes.sort((a, b) => {
-                    const at = (a.tagName || '').toLowerCase();
-                    const bt = (b.tagName || '').toLowerCase();
-                    const ap = at === 'a' ? 0 : at === 'button' ? 1 : at === 'td' ? 2 : 3;
-                    const bp = bt === 'a' ? 0 : bt === 'button' ? 1 : bt === 'td' ? 2 : 3;
-                    return ap - bp || (a.innerText || '').length - (b.innerText || '').length;
-                });
-
-                const el = nodes[0];
-                const clickable = el.closest('a, button, [role=button]') || el;
-                clickable.scrollIntoView({block: 'center', inline: 'center'});
-                clickable.click();
-                return true;
-            }
-            """,
-            cad,
-        )
-        if clicked:
-            return
-
+        errors: list[str] = []
         try:
-            self.page.get_by_text(cad, exact=False).first.click(timeout=10000)
-            return
+            self.close_rosreestr_notifications()
         except Exception:
             pass
 
-        raise RuntimeError(f"Не удалось открыть результат {cad}")
+        for selector in ["a", "button", "[role=button]", "[onclick]"]:
+            try:
+                loc = self.page.locator(selector).filter(has_text=cad).first
+                loc.scroll_into_view_if_needed(timeout=3000)
+                loc.click(timeout=5000)
+                return
+            except Exception as e:
+                errors.append(f"{selector}: {e}")
+
+        try:
+            clicked = self.page.evaluate(
+                r"""
+                (cad) => {
+                    function visible(el) {
+                        const r = el.getBoundingClientRect();
+                        const st = window.getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+                    }
+                    const nodes = Array.from(document.querySelectorAll('a, button, [role=button], [onclick], span, div, td'))
+                        .filter(n => visible(n) && (n.innerText || '').includes(cad));
+                    for (const n of nodes) {
+                        const clickable = n.closest('a, button, [role=button], [onclick]');
+                        if (!clickable || !visible(clickable)) continue;
+                        clickable.scrollIntoView({block: 'center', inline: 'center'});
+                        clickable.click();
+                        return true;
+                    }
+                    return false;
+                }
+                """,
+                cad,
+            )
+            if clicked:
+                return
+        except Exception as e:
+            errors.append(f"DOM: {e}")
+
+        try:
+            self.page.get_by_text(cad, exact=False).first.click(timeout=5000)
+            return
+        except Exception as e:
+            errors.append(f"text: {e}")
+
+        raise RuntimeError(f"Не удалось кликнуть результат {cad}: " + " | ".join(errors[-3:]))
 
     def back_to_results(self) -> None:
         assert self.page is not None
@@ -6563,7 +7829,7 @@ class App(tk.Tk):
 
     def _refresh_oss_mode_ui(self, *_args) -> None:
         mode_label = getattr(self, "parser_mode_var", tk.StringVar(value="Реестр для ОСС")).get()
-        show_format = mode_label == "Реестр для ОСС"
+        show_format = mode_label in {"Реестр для ОСС", "Реестр по списку кадастровых номеров"}
         if hasattr(self, "oss_format_label") and hasattr(self, "oss_format_combo"):
             if show_format:
                 self.oss_format_label.grid()
@@ -6574,10 +7840,64 @@ class App(tk.Tk):
         hint = ""
         if mode_label == "Реестр для ОСС":
             hint = "Итоговый реестр для ОСС. Можно выбрать формат Burmistr или Roskvartal."
+        elif mode_label == "Реестр по списку кадастровых номеров":
+            hint = "Для домов, где Росреестр плохо ищет по адресу: Excel с колонками квартира/помещение и кадастровый номер. Формат выгрузки можно выбрать Burmistr или Roskvartal."
         elif mode_label == "Полные сведения по объектам":
             hint = "Подробный рабочий Excel по карточкам Росреестра. Не привязан к Burmistr/Roskvartal."
         elif mode_label == "Реестр кадастровых номеров":
             hint = "Быстрый сбор кадастровых номеров и основных сведений."
+        is_cad_queue = mode_label == "Реестр по списку кадастровых номеров"
+        disabled_in_cad_queue = [
+            "start_flat_entry",
+            "end_flat_entry",
+            "extra_unit_numbers_entry",
+            "manual_unit_numbers_entry",
+            "manual_unit_file_path_entry",
+            "search_numbered_check",
+            "try_variants_check",
+            "include_unnumbered_check",
+        ]
+        for attr in disabled_in_cad_queue:
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                try:
+                    widget.configure(state="disabled" if is_cad_queue else "normal")
+                except Exception:
+                    pass
+
+        browse_buttons = getattr(self, "_browse_buttons", {})
+        for key in ["manual_unit_file_path"]:
+            btn = browse_buttons.get(key) if isinstance(browse_buttons, dict) else None
+            if btn is not None:
+                try:
+                    btn.configure(state="disabled" if is_cad_queue else "normal")
+                except Exception:
+                    pass
+
+        if hasattr(self, "cad_queue_mode_button"):
+            try:
+                self.cad_queue_mode_button.configure(state="disabled" if is_cad_queue else "normal")
+            except Exception:
+                pass
+        if hasattr(self, "cad_queue_disable_button"):
+            try:
+                self.cad_queue_disable_button.configure(state="normal" if is_cad_queue else "disabled")
+            except Exception:
+                pass
+
+        if hasattr(self, "cad_queue_status_var"):
+            if is_cad_queue:
+                self.cad_queue_status_var.set(
+                    "Активен режим списка КН: обычный диапазон квартир, ручная очередь и поиск без номеров не используются. "
+                    "Проверьте файл списка КН, выберите итоговый Excel и нажмите «Старт». "
+                    "Поле «Адрес до номера» можно оставить для проверки похожести адреса карточки."
+                )
+            else:
+                self.cad_queue_status_var.set(
+                    "Для домов с кривой выдачей по адресу: выберите Excel/TXT со списком КН, нажмите «Проверить файл списка КН» "
+                    "или «Включить режим списка КН», затем нажмите «Старт»."
+                )
+
         if hasattr(self, "parser_mode_hint_var"):
             self.parser_mode_hint_var.set(hint)
 
@@ -6594,6 +7914,9 @@ class App(tk.Tk):
             func = browse_func or self._browse
             btn = ttk.Button(parent, text="Выбрать…", command=lambda: func(key, browse))
             btn.grid(row=row, column=2, sticky="w", padx=6)
+            if not hasattr(self, "_browse_buttons"):
+                self._browse_buttons = {}
+            self._browse_buttons[key] = btn
         return entry
 
     def _build_ui(self) -> None:
@@ -6649,23 +7972,23 @@ class App(tk.Tk):
         main_grid.pack(fill=tk.X)
         main_grid.columnconfigure(1, weight=1)
 
-        self._add_labeled_entry(main_grid, 0, "Адрес до номера", "address_prefix", var_map=self.vars)
-        self._add_labeled_entry(main_grid, 1, "Начальная квартира/объект", "start_flat", var_map=self.vars, width=12)
-        self._add_labeled_entry(main_grid, 2, "Конечная квартира/объект", "end_flat", var_map=self.vars, width=12)
-        self._add_labeled_entry(main_grid, 3, "Доп. номера к диапазону: 9А, 15Б, 27/1", "extra_unit_numbers", var_map=self.vars)
-        self._add_labeled_entry(main_grid, 4, "Ручная очередь помещений: 1, 2, 3А", "manual_unit_numbers", var_map=self.vars)
-        self._add_labeled_entry(main_grid, 5, "Файл ручной очереди: txt / Excel / Word", "manual_unit_file_path", var_map=self.vars, browse="file")
+        self.address_prefix_entry = self._add_labeled_entry(main_grid, 0, "Адрес до номера", "address_prefix", var_map=self.vars)
+        self.start_flat_entry = self._add_labeled_entry(main_grid, 1, "Начальная квартира/объект", "start_flat", var_map=self.vars, width=12)
+        self.end_flat_entry = self._add_labeled_entry(main_grid, 2, "Конечная квартира/объект", "end_flat", var_map=self.vars, width=12)
+        self.extra_unit_numbers_entry = self._add_labeled_entry(main_grid, 3, "Доп. номера к диапазону: 9А, 15Б, 27/1", "extra_unit_numbers", var_map=self.vars)
+        self.manual_unit_numbers_entry = self._add_labeled_entry(main_grid, 4, "Ручная очередь помещений: 1, 2, 3А", "manual_unit_numbers", var_map=self.vars)
+        self.manual_unit_file_path_entry = self._add_labeled_entry(main_grid, 5, "Файл ручной очереди: txt / Excel / Word", "manual_unit_file_path", var_map=self.vars, browse="file")
         self._add_labeled_entry(main_grid, 6, "Итоговый Excel", "output_path", var_map=self.vars, browse="save")
 
         ttk.Label(main_grid, text="Режим парсинга").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
         parser_mode_value = str(self.cfg.get("parser_mode") or ("cadastral" if self.cfg.get("collect_cadastral_only") else "oss"))
-        if parser_mode_value == "snt":
+        if parser_mode_value in {"snt", "cad_queue"}:
             parser_mode_value = "oss"
         self.parser_mode_var = tk.StringVar(value=PARSER_MODE_LABELS.get(parser_mode_value, "Реестр для ОСС"))
         parser_mode_combo = ttk.Combobox(
             main_grid,
             textvariable=self.parser_mode_var,
-            values=["Реестр для ОСС", "Полные сведения по объектам", "Реестр кадастровых номеров"],
+            values=["Реестр для ОСС", "Реестр по списку кадастровых номеров", "Полные сведения по объектам", "Реестр кадастровых номеров"],
             state="readonly",
             width=32,
         )
@@ -6688,6 +8011,43 @@ class App(tk.Tk):
         ttk.Label(main_grid, textvariable=self.parser_mode_hint_var, foreground="#555555", wraplength=820).grid(row=8, column=1, columnspan=3, sticky="w", pady=(0, 4))
         self.parser_mode_var.trace_add("write", self._refresh_oss_mode_ui)
 
+
+        cad_queue_section, _toggle_cad_queue = self._make_collapsible_section(frm, "Парсинг по готовому списку кадастровых номеров", visible=False)
+        cad_queue_box = ttk.LabelFrame(cad_queue_section, text="Excel/TXT со списком КН", padding=(8, 6))
+        cad_queue_box.pack(fill=tk.X, pady=(0, 8))
+        cad_queue_grid = ttk.Frame(cad_queue_box)
+        cad_queue_grid.pack(fill=tk.X)
+
+        ttk.Label(cad_queue_grid, text="Файл списка КН").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        cad_queue_var = self.vars.get("cadastral_queue_file_path")
+        if cad_queue_var is None:
+            cad_queue_var = tk.StringVar(value=str(self.cfg.get("cadastral_queue_file_path", "")))
+            self.vars["cadastral_queue_file_path"] = cad_queue_var
+        self.cadastral_queue_file_entry = ttk.Entry(cad_queue_grid, textvariable=cad_queue_var, width=56)
+        self.cadastral_queue_file_entry.grid(row=0, column=1, sticky="w", pady=4)
+        self.bind_editable_widget(self.cadastral_queue_file_entry)
+        ttk.Button(cad_queue_grid, text="Выбрать…", command=lambda: self._browse("cadastral_queue_file_path", "file")).grid(row=0, column=2, sticky="w", padx=(6, 6), pady=4)
+        ttk.Button(cad_queue_grid, text="Проверить файл списка КН", command=self.preview_cadastral_queue_file).grid(row=0, column=3, sticky="w", padx=(0, 6), pady=4)
+        self.cad_queue_mode_button = ttk.Button(cad_queue_grid, text="Включить режим списка КН", command=self.enable_cadastral_queue_mode_from_ui)
+        self.cad_queue_mode_button.grid(row=0, column=4, sticky="w", padx=(0, 6), pady=4)
+        self.cad_queue_disable_button = ttk.Button(cad_queue_grid, text="Выключить режим КН", command=self.disable_cadastral_queue_mode_from_ui)
+        self.cad_queue_disable_button.grid(row=0, column=5, sticky="w", pady=4)
+
+        self.cad_queue_status_var = tk.StringVar(value="")
+        ttk.Label(
+            cad_queue_grid,
+            textvariable=self.cad_queue_status_var,
+            foreground="#555555",
+            wraplength=900,
+        ).grid(row=1, column=1, columnspan=5, sticky="w", pady=(0, 4))
+
+        self.cadastral_queue_validate_address_var = tk.BooleanVar(value=bool(self.cfg.get("cadastral_queue_validate_address", True)))
+        ttk.Checkbutton(
+            cad_queue_grid,
+            text="Предупреждать, если адрес карточки не похож на адрес дома",
+            variable=self.cadastral_queue_validate_address_var,
+        ).grid(row=2, column=1, columnspan=5, sticky="w", pady=2)
+
         advanced, _toggle_advanced = self._make_collapsible_section(frm, "Расширенные настройки парсинга ОСС", visible=False)
         advanced_grid = ttk.Frame(advanced)
         advanced_grid.pack(fill=tk.X)
@@ -6695,15 +8055,18 @@ class App(tk.Tk):
         advanced_grid.columnconfigure(1, weight=1)
 
         self.search_numbered_var = tk.BooleanVar(value=bool(self.cfg.get("search_numbered_units", True)))
-        ttk.Checkbutton(advanced_grid, text="Искать квартиры/помещения по диапазону номеров", variable=self.search_numbered_var).grid(row=0, column=0, sticky="w", pady=2)
+        self.search_numbered_check = ttk.Checkbutton(advanced_grid, text="Искать квартиры/помещения по диапазону номеров", variable=self.search_numbered_var)
+        self.search_numbered_check.grid(row=0, column=0, sticky="w", pady=2)
         self.try_variants_var = tk.BooleanVar(value=bool(self.cfg.get("try_address_variants", True)))
-        ttk.Checkbutton(advanced_grid, text="Пробовать варианты номера: кв / квартира / пом. / помещение / №", variable=self.try_variants_var).grid(row=1, column=0, sticky="w", pady=2)
+        self.try_variants_check = ttk.Checkbutton(advanced_grid, text="Пробовать варианты номера: кв / квартира / пом. / помещение / №", variable=self.try_variants_var)
+        self.try_variants_check.grid(row=1, column=0, sticky="w", pady=2)
         self.strict_street_var = tk.BooleanVar(value=bool(self.cfg.get("strict_street_match", False)))
         ttk.Checkbutton(advanced_grid, text="Строго совпадать улице (не смешивать похожие названия)", variable=self.strict_street_var).grid(row=2, column=0, sticky="w", pady=2)
         self.strict_house_var = tk.BooleanVar(value=bool(self.cfg.get("strict_house_match", True)))
         ttk.Checkbutton(advanced_grid, text="Строго совпадать номеру дома", variable=self.strict_house_var).grid(row=3, column=0, sticky="w", pady=2)
         self.include_unnumbered_var = tk.BooleanVar(value=bool(self.cfg.get("include_unnumbered_house_objects", False)))
-        ttk.Checkbutton(advanced_grid, text="Поиск помещений без номеров: голый адрес дома после диапазона", variable=self.include_unnumbered_var).grid(row=4, column=0, sticky="w", pady=2)
+        self.include_unnumbered_check = ttk.Checkbutton(advanced_grid, text="Поиск помещений без номеров: голый адрес дома после диапазона", variable=self.include_unnumbered_var)
+        self.include_unnumbered_check.grid(row=4, column=0, sticky="w", pady=2)
 
         self.auto_output_filename_var = tk.BooleanVar(value=bool(self.cfg.get("auto_output_filename", True)))
         ttk.Checkbutton(advanced_grid, text="Автоимя итогового файла по адресу дома", variable=self.auto_output_filename_var).grid(row=0, column=1, sticky="w", padx=(30, 0), pady=2)
@@ -6851,52 +8214,74 @@ class App(tk.Tk):
         version = ttk.Label(frm, text=f"Версия: {APP_TITLE}", font=("Segoe UI", 11))
         version.pack(anchor="w", pady=(0, 16))
 
-        info = (
+        info_text_plain = (
             "Назначение:\n"
-            "Локальный сбор бесплатной справочной информации Росреестра "
-            "и сопоставление нового реестра со старыми реестрами собственников.\n\n"
+            "Локальный сбор бесплатной справочной информации Росреестра и сопоставление нового реестра со старыми реестрами собственников.\n\n"
             "Режим работы:\n"
-            "Авторизация выполняется пользователем вручную в открытом браузере. "
-            "Логин, пароль, SMS-код и капча не вводятся в программу.\n\n"
-            "Программа не заказывает платные выписки, не отправляет заявления, "
-            "не меняет данные аккаунта и не выполняет юридически значимые действия.\n\n"
-            "Программа создана для локальной подготовки рабочих реестров "
-            "и снижения ручной работы."
+            "Авторизация выполняется пользователем вручную в открытом браузере. Логин, пароль, SMS-код и капча не вводятся в программу.\n\n"
+            "Программа не заказывает платные выписки, не отправляет заявления, не меняет данные аккаунта и не выполняет юридически значимые действия.\n\n"
+            "Программа создана для локальной подготовки рабочих реестров и снижения ручной работы."
         )
 
-        box = tk.Text(frm, height=14, wrap="word", font=("Segoe UI", 11), padx=12, pady=12)
-        box.pack(fill=tk.X, pady=(0, 12))
-        box.insert("1.0", info)
-        box.configure(state="disabled")
-        box.bind("<Button-3>", self.show_about_menu)
-        self.about_text = box
+        info_frame = ttk.LabelFrame(frm, text="О программе", padding=(10, 8))
+        info_frame.pack(fill=tk.X, pady=(0, 12))
+        info_frame.columnconfigure(1, weight=1)
 
-        donate_frame = ttk.Frame(frm)
-        donate_frame.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(donate_frame, text="На чай разработчику (Карта Сбер): 2202 2088 9799 2260").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(donate_frame, text="Скопировать номер карты", command=self.copy_donate_card).pack(side=tk.LEFT)
+        rows = [
+            (
+                "Назначение:",
+                "Локальный сбор бесплатной справочной информации Росреестра и сопоставление нового реестра со старыми реестрами собственников.",
+            ),
+            (
+                "Режим работы:",
+                "Авторизация выполняется пользователем вручную в открытом браузере. Логин, пароль, SMS-код и капча не вводятся в программу.",
+            ),
+            (
+                "Важно:",
+                "Программа не заказывает платные выписки, не отправляет заявления, не меняет данные аккаунта и не выполняет юридически значимые действия.",
+            ),
+            (
+                "Для чего создана:",
+                "Локальная подготовка рабочих реестров и снижение ручной работы.",
+            ),
+        ]
+
+        for row_idx, (label, value) in enumerate(rows):
+            ttk.Label(info_frame, text=label, font=("Segoe UI", 9, "bold")).grid(
+                row=row_idx, column=0, sticky="nw", padx=(0, 12), pady=(3, 5)
+            )
+            ttk.Label(info_frame, text=value, wraplength=930, justify="left").grid(
+                row=row_idx, column=1, sticky="ew", pady=(3, 5)
+            )
+
+        # Для внутренней функции "Копировать всё" сохраняем тот же текст, но не
+        # показываем его как большое белое поле.
+        self.about_text_content = info_text_plain
+        self.about_text = None
+
+        support_frame = ttk.LabelFrame(frm, text="Поддержать проект", padding=(10, 8))
+        support_frame.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(support_frame, text="Номер карты:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(support_frame, text="2202 2088 9799 2260").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(support_frame, text="Скопировать номер карты", command=self.copy_donate_card).pack(side=tk.LEFT)
 
         self.about_menu = tk.Menu(self, tearoff=0)
         self.about_menu.add_command(label="Копировать всё", command=self.copy_about_text)
 
         update_frame = ttk.LabelFrame(frm, text="Обновления и репозиторий", padding=(10, 8))
-        update_frame.pack(fill=tk.BOTH, expand=True)
+        update_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.update_status_var = tk.StringVar(value=f"Текущая версия: {APP_TITLE}")
+        ttk.Label(update_frame, textvariable=self.update_status_var, wraplength=900, justify="left").grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 8))
+
+        ttk.Button(update_frame, text="Проверить обновление", command=self.check_update).grid(row=1, column=0, sticky="w", padx=(0, 8), pady=2)
+        ttk.Button(update_frame, text="Скачать и установить обновление", command=self.download_and_install_update).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=2)
+        ttk.Button(update_frame, text="Открыть репозиторий", command=self.open_repository_url).grid(row=1, column=2, sticky="w", padx=(0, 8), pady=2)
+        ttk.Button(update_frame, text="Открыть страницу релиза", command=self.open_release_url).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=2)
+        ttk.Button(update_frame, text="Открыть config.json", command=self.open_config_file).grid(row=1, column=4, sticky="e", pady=2)
 
         repo_url = str(self.cfg.get("repository_url") or "").strip()
         manifest_url = str(self.cfg.get("update_manifest_url") or "").strip()
-
-        ttk.Label(update_frame, text=f"Текущая версия: {APP_TITLE}").grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
-        self.update_status_var = tk.StringVar(value=(
-            "Проверка обновлений будет доступна после указания repository_url и update_manifest_url в config.json."
-            if not manifest_url else "Нажмите «Проверить обновление»."
-        ))
-        ttk.Label(update_frame, textvariable=self.update_status_var, wraplength=900).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(0, 8))
-
-        ttk.Button(update_frame, text="Проверить обновление", command=self.check_update).grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Button(update_frame, text="Скачать и установить обновление", command=self.download_and_install_update).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=3)
-        ttk.Button(update_frame, text="Открыть репозиторий", command=self.open_repository_url).grid(row=2, column=2, sticky="w", padx=(0, 8), pady=3)
-        ttk.Button(update_frame, text="Открыть страницу релиза", command=self.open_release_url).grid(row=2, column=3, sticky="w", padx=(0, 8), pady=3)
-        ttk.Button(update_frame, text="Открыть config.json", command=self.open_config_file).grid(row=2, column=4, sticky="w", pady=3)
 
         repo_text = repo_url or "не задано"
         manifest_text = manifest_url or "не задано"
@@ -6976,6 +8361,7 @@ class App(tk.Tk):
             "template_burmistr.xlsx",
             "template_roskvartal.xlsx",
             "template_snt.xlsx",
+            "template_full_info.xlsx",
         ]
         missing = [x for x in required if not (root / x).exists()]
         if missing:
@@ -7191,13 +8577,15 @@ class App(tk.Tk):
         self.clipboard_append("2202208897992260")
 
     def copy_about_text(self) -> None:
-        parts = []
-        widget = getattr(self, "about_text", None)
-        if widget is not None:
-            try:
-                parts.append(widget.get("1.0", "end-1c"))
-            except Exception:
-                pass
+        parts: list[str] = []
+        try:
+            content = str(getattr(self, "about_text_content", "") or "").strip()
+            if content:
+                parts.append(content)
+            elif getattr(self, "about_text", None) is not None:
+                parts.append(self.about_text.get("1.0", "end-1c"))
+        except Exception:
+            pass
         status = getattr(self, "update_status_var", None)
         if status is not None:
             try:
@@ -8291,6 +9679,7 @@ class App(tk.Tk):
             "template_path": "last_dir_template",
             "output_path": "last_dir_output",
             "manual_unit_file_path": "last_dir_manual_queue",
+            "cadastral_queue_file_path": "last_dir_cadastral_queue",
             "browser_profile_dir": "last_dir_browser_profile",
             "match_new_registry_path": "last_dir_new_registry",
             "match_old_registry_path": "last_dir_old_registry",
@@ -8318,6 +9707,7 @@ class App(tk.Tk):
             "template_path": "last_dir_template",
             "output_path": "last_dir_output",
             "manual_unit_file_path": "last_dir_manual_queue",
+            "cadastral_queue_file_path": "last_dir_cadastral_queue",
             "browser_profile_dir": "last_dir_browser_profile",
             "match_new_registry_path": "last_dir_new_registry",
             "match_old_registry_path": "last_dir_old_registry",
@@ -8636,6 +10026,89 @@ class App(tk.Tk):
         txt.configure(state="normal")
         self.bind_editable_widget(txt)
 
+
+    def enable_cadastral_queue_mode_from_ui(self, log_message: bool = True) -> None:
+        if hasattr(self, "parser_mode_var"):
+            self.parser_mode_var.set("Реестр по списку кадастровых номеров")
+        try:
+            self._refresh_oss_mode_ui()
+            self.update_progress_label()
+        except Exception:
+            pass
+        if log_message:
+            self.log("Включён режим: Реестр по списку кадастровых номеров. Для запуска нажмите «Старт».")
+
+    def disable_cadastral_queue_mode_from_ui(self, log_message: bool = True) -> None:
+        if hasattr(self, "parser_mode_var"):
+            self.parser_mode_var.set("Реестр для ОСС")
+        try:
+            self._refresh_oss_mode_ui()
+            self.update_progress_label()
+        except Exception:
+            pass
+        if log_message:
+            self.log("Режим списка КН выключен. Активен обычный режим: Реестр для ОСС.")
+
+    def prepare_start_from_ui(self) -> bool:
+        cfg = self.collect_cfg()
+        mode = str(cfg.get("parser_mode") or "oss")
+        cad_path = str(cfg.get("cadastral_queue_file_path") or "").strip()
+
+        if mode == "cad_queue":
+            if not cad_path:
+                messagebox.showwarning(APP_TITLE, "Для режима «Реестр по списку кадастровых номеров» сначала выберите Excel/TXT со списком КН.")
+                return False
+            return True
+
+        # Выбранный ранее файл списка КН сам по себе больше не переключает режим.
+        return True
+
+    def preview_cadastral_queue_file(self) -> None:
+        path = ""
+        try:
+            path = str(self.vars.get("cadastral_queue_file_path").get() if "cadastral_queue_file_path" in self.vars else "").strip()
+        except Exception:
+            path = ""
+
+        if not path:
+            messagebox.showwarning(APP_TITLE, "Сначала выберите Excel/TXT со списком кадастровых номеров.")
+            return
+
+        try:
+            text = cadastral_queue_preview_text(path, max_items=80)
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Не удалось проверить файл списка КН:\n{e}")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Проверка списка кадастровых номеров")
+        win.geometry("980x640")
+        win.minsize(760, 420)
+
+        frame = ttk.Frame(win, padding=6)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        txt = tk.Text(frame, wrap="none", font=("Consolas", 10), undo=False)
+        yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=txt.yview)
+        xscroll = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=txt.xview)
+        txt.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        txt.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        txt.insert("1.0", text)
+        txt.configure(state="normal")
+        self.bind_editable_widget(txt)
+
+        buttons = ttk.Frame(win, padding=(6, 0, 6, 6))
+        buttons.pack(fill=tk.X)
+        ttk.Button(buttons, text="Включить режим списка КН", command=self.enable_cadastral_queue_mode_from_ui).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="Закрыть", command=win.destroy).pack(side=tk.LEFT)
+
     def collect_cfg(self) -> dict[str, Any]:
         cfg = self.cfg.copy()
         cfg["search_numbered_units"] = bool(getattr(self, "search_numbered_var", tk.BooleanVar(value=True)).get())
@@ -8654,6 +10127,7 @@ class App(tk.Tk):
         cfg["resume_enabled"] = bool(getattr(self, "resume_enabled_var", tk.BooleanVar(value=True)).get())
         cfg["skip_done_units"] = bool(getattr(self, "skip_done_units_var", tk.BooleanVar(value=True)).get())
         cfg["skip_done_cadastrals"] = bool(getattr(self, "skip_done_cadastrals_var", tk.BooleanVar(value=True)).get())
+        cfg["cadastral_queue_validate_address"] = bool(getattr(self, "cadastral_queue_validate_address_var", tk.BooleanVar(value=True)).get())
         cfg["pause_preset"] = getattr(self, "pause_preset_var", tk.StringVar(value="Обычно")).get()
         for key, var in self.vars.items():
             value: Any = var.get().strip()
@@ -8685,6 +10159,11 @@ class App(tk.Tk):
         address_prefix = str(cfg.get("address_prefix") or "").strip()
         house = house_address_from_prefix(address_prefix) or address_prefix or "house"
         mode = str(cfg.get("parser_mode") or "oss").strip()
+        if mode == "cad_queue":
+            queue_path = str(cfg.get("cadastral_queue_file_path") or "").strip()
+            source = Path(queue_path).stem if queue_path else house
+            slug = filename_slug(f"cad_queue_{source}") or "cad_queue"
+            return self.base_dir / "state" / f"progress_{slug}.json"
         mode_prefix = mode if mode in {"oss", "full", "cadastral"} else "oss"
         slug = filename_slug(f"{mode_prefix}_{house}_kv_{start_flat}-{end_flat}") or f"progress_{mode_prefix}"
         return self.base_dir / "state" / f"progress_{slug}.json"
@@ -8752,7 +10231,16 @@ class App(tk.Tk):
 
     def save_settings(self) -> None:
         self.cfg = self.collect_cfg()
-        save_config(self.config_path, self.cfg)
+
+        # Режим списка КН — рабочий сценарий на один запуск, а не режим по умолчанию.
+        # Не сохраняем cad_queue в config.json, чтобы после перезапуска программа
+        # открывалась в безопасном обычном режиме ОСС.
+        cfg_to_save = dict(self.cfg)
+        if str(cfg_to_save.get("parser_mode") or "").strip() == "cad_queue":
+            cfg_to_save["parser_mode"] = "oss"
+            cfg_to_save["collect_cadastral_only"] = False
+
+        save_config(self.config_path, cfg_to_save)
         self.update_progress_label()
         self.log(f"Настройки сохранены: {self.config_path}")
 
@@ -8834,6 +10322,8 @@ class App(tk.Tk):
                     pass
 
     def start_worker(self) -> None:
+        if not self.prepare_start_from_ui():
+            return
         if self.worker and self.worker.is_alive():
             if getattr(self.worker, "idle", False):
                 self.save_settings()
