@@ -1,6 +1,6 @@
 # Локальный парсер справочной информации Росреестра
 
-📢 [Telegram-канал «Ассистенты УО»](https://t.me/assistant_yo)
+[![Telegram](https://img.shields.io/badge/Telegram-Ассистенты%20УО-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/assistant_yo)
 
 Программа для Windows, которая помогает собирать справочную информацию Росреестра и сохранять её в Excel.
 
