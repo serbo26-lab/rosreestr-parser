@@ -1,5 +1,7 @@
 # Локальный парсер справочной информации Росреестра
 
+[![Поддержать проект через CloudTips](docs/assets/cloudtips-support.svg)](https://pay.cloudtips.ru/p/6b9c3555)
+
 [![Telegram](https://img.shields.io/badge/Telegram-Ассистенты%20УО-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/assistant_yo)
 
 Программа для Windows, которая помогает собирать справочную информацию Росреестра и сохранять её в Excel.
