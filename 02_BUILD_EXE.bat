@@ -9,14 +9,14 @@ echo.
 if not exist "src\rosreestr_parser_app.py" (
   echo ERROR: src\rosreestr_parser_app.py not found.
   echo Run this BAT from repository root folder.
-  pause
+  if not defined CI pause
   exit /b 1
 )
 
 if not exist ".venv\Scripts\python.exe" (
   echo ERROR: virtual environment not found.
   echo Run 00_SETUP.bat first.
-  pause
+  if not defined CI pause
   exit /b 1
 )
 
