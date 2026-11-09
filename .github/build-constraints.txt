@@ -1,0 +1,7 @@
+# Pinned tested targets for GitHub Windows build with Python 3.13.
+# Local requirements.txt remains user-friendly and independent.
+playwright==1.64.1
+openpyxl==3.1.5
+pyinstaller==6.22.3
+python-docx==1.2.0
+xlrd==2.0.2
