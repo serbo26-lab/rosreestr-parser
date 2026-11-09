@@ -1,0 +1,74 @@
+name: DEV Build (Windows)
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - 'dev/**'
+      - 'feature/**'
+    paths-ignore:
+      - latest.json
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Check source syntax and defaults
+        shell: pwsh
+        run: |
+          python -m py_compile src/rosreestr_parser_app.py scripts/ci_tools.py
+          if ($LASTEXITCODE -ne 0) { throw "Python syntax error" }
+          python scripts/ci_tools.py check-source
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source/config" }
+      - name: Set up isolated build environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { throw "Could not create virtual environment" }
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt -c .github/build-constraints.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+      - name: Stamp DEV title and disable stable updates
+        shell: pwsh
+        run: |
+          python scripts/ci_tools.py stamp-dev --sha "$env:GITHUB_SHA"
+          if ($LASTEXITCODE -ne 0) { throw "DEV stamp failed" }
+      - name: Build portable Windows EXE
+        shell: cmd
+        run: call 02_BUILD_EXE.bat
+      - name: Verify DEV archive
+        shell: pwsh
+        run: |
+          python scripts/ci_tools.py verify-zip --zip release_assets/rosreestr_parser.zip --sha-file release_assets/rosreestr_parser.sha256.txt
+          if ($LASTEXITCODE -ne 0) { throw "ZIP validation failed" }
+          Move-Item release_assets/rosreestr_parser.zip release_assets/rosreestr_parser_dev.zip
+          Move-Item release_assets/rosreestr_parser.sha256.txt release_assets/rosreestr_parser_dev.sha256.txt
+      - name: Upload DEV artifact only (no Release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosreestr-parser-dev-${{ github.run_number }}-${{ github.sha }}
+          path: |
+            release_assets/rosreestr_parser_dev.zip
+            release_assets/rosreestr_parser_dev.sha256.txt
+          if-no-files-found: error
+          retention-days: 14
