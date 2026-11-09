@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-local files (never publish or commit)
+config.json
+release_assets/
+output/
+state/
+profiles/
+profile_rosreestr/
+updates/
+*.bak*
+rosreestr_v[0-9]*_*.py
+template.xlsx
+docs/wiki.md
+README_FIRST.txt
+SOURCE_RUN.md
+latest.example.json

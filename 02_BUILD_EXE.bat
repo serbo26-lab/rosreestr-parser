@@ -117,7 +117,7 @@ echo.
 REM Remove PyInstaller temp build folder after success so it is not confused with the final program.
 if exist "build" rmdir /s /q "build"
 
-pause
+if not defined CI pause
 exit /b 0
 
 :FAIL
@@ -126,5 +126,5 @@ echo ERROR: EXE build failed.
 echo If a build folder exists, it is only diagnostic temporary files.
 echo The runnable program must be in dist\RosreestrParser.
 echo.
-pause
+if not defined CI pause
 exit /b 1
