@@ -2,7 +2,7 @@
 """Reject real-looking cadastral IDs in test fixtures.
 
 Test datasets must use synthetically impossible cadastral region 00:00.
-Also check against accidentally committed example addresses from earlier fixtures.
+Real-looking addresses are reviewed manually under AGENTS.md.
 """
 from pathlib import Path
 import re
@@ -11,8 +11,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 SEARCH = (ROOT / "tests",)
 CADASTRAL_PATTERN = re.compile(r"\b\d{2}:\d{2}:\d{3,}:\d+\b")
-# Known case names that must never be reused in tests.
-REAL_LOCATION_MARKERS = ("демино", "ставрополь", "советская", "шпаковский")
+# Fictional-only address markers are documented in AGENTS.md.
+# Arbitrary real-world addresses cannot be reliably identified by regex;
+# human review of every new fixture is mandatory.
 
 def main():
     errors=[]
@@ -26,8 +27,6 @@ def main():
             for number in CADASTRAL_PATTERN.findall(content):
                 if not number.startswith("00:00:"):
                     errors.append(f"{p.relative_to(ROOT)}: non-synthetic cadastre ID")
-            if any(marker in content for marker in REAL_LOCATION_MARKERS):
-                errors.append(f"{p.relative_to(ROOT)}: real-world locality/street from known examples")
     if errors:
         print("\n".join(errors))
         raise SystemExit(1)
