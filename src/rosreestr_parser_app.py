@@ -479,6 +479,33 @@ def extract_flat_no(address: str) -> str:
     return ""
 
 
+def cad_queue_unit_from_result_row(row_text: Any, target_cadastral: str) -> tuple[str, str]:
+    """
+    В режиме списка КН восстанавливает номер помещения из адреса строки
+    выдачи, содержащей именно искомый КН. Порядок строк Excel не используется.
+    """
+    source = str(row_text or "")
+    target = clean_cadastral_number(target_cadastral)
+    if not target or clean_cadastral_number(source) != target:
+        return "", ""
+
+    for raw_line in source.splitlines():
+        address = re.sub(r"\s+", " ", raw_line).strip()
+        unit = clean_unit_number(extract_flat_no(address))
+        if not unit:
+            continue
+        # Строка "Помещение 2" без адреса не является номером квартиры.
+        if not re.search(
+            r"(?<![а-яa-z])(?:ул\.?|улица|д\.?|дом|пер\.?|переулок|"
+            r"просп\.?|проспект|пр-кт|проезд|шоссе|бульвар)"
+            r"(?=[\s,])",
+            normalize_text(address),
+        ):
+            continue
+        return unit, address
+    return "", ""
+
+
 def address_has_trailing_unit(address: str, expected_no: str, search_house_no: str = "") -> bool:
     """
     Понимает редкий формат адреса без маркера помещения: '..., д 66, 1'.
@@ -549,7 +576,7 @@ def extract_house_no(address: str) -> str:
 
     Сначала ищем явный маркер д/дом.
     Затем fallback для адресов без слова "улица", например:
-    "Ставрополь, Братский, 7, кв 7" — дом 7, квартира 7.
+    "Тестоград, Макетная, 7, кв 7" — дом 7, квартира 7.
 
     Это важно: иначе строгая проверка дома не работает для коротких адресов,
     и поиск может принять "Братский, д 12, кв 7" как подходящий результат
@@ -902,7 +929,7 @@ def extract_explicit_settlement(address: Any) -> str:
 
 
 def extract_query_settlement(address: Any) -> str:
-    """Населённый пункт из пользовательского запроса. Поддерживает и короткое: 'Ставрополь, Братский, 7, кв 1'."""
+    """Населённый пункт из пользовательского запроса. Поддерживает и короткое: 'Тестоград, Макетная, 7, кв 1'."""
     explicit = extract_explicit_settlement(address)
     if explicit:
         return explicit
@@ -915,7 +942,7 @@ def extract_query_settlement(address: Any) -> str:
     # Если первый фрагмент уже похож на улицу/дом, город явно не задан.
     if re.search(r"\b(ул\.?|улица|проспект|проезд|пер\.?|переулок|д\.?|дом|снт|днт|дск|ст|с/т)\b", first, flags=re.I):
         return ""
-    # Короткий адрес часто начинается с города: 'Ставрополь, Братский, 7, кв 1'.
+    # Короткий адрес часто начинается с города: 'Тестоград, Макетная, 7, кв 1'.
     if re.search(r"[а-яa-zё]", first, flags=re.I) and not re.search(r"\d", first):
         return _clean_place_name(first)
     return ""
@@ -924,7 +951,7 @@ def extract_query_settlement(address: Any) -> str:
 def settlement_matches(search_address_or_city: Any, result_address: Any) -> bool:
     """
     Проверяет именно населённый пункт, а не регион.
-    Важно: 'Ставрополь' не должен совпадать только с 'Ставропольский край'.
+    Важно: 'Тестоград' не должен совпадать только с 'Тестоградская область'.
     """
     q = extract_query_settlement(search_address_or_city)
     if not q:
@@ -2198,7 +2225,7 @@ def parse_card_text(text: str, fallback_flat: str, fallback_cadastral: str = "")
     # На странице в DOM иногда остаётся поисковая форма с подписью
     # "Адрес или кадастровый номер". Старый разбор мог принять текст
     # "Адрес или" за кадастровый номер. Поэтому кадастровый номер
-    # считаем валидным только если он реально похож на 26:12:030108:985.
+    # считаем валидным только если он реально похож на 00:00:000000:1001.
     raw_cadastral = find_line_value(lines, "Кадастровый номер")
     cadastral_number = raw_cadastral if re.fullmatch(r"\d{2}:\d{2}:\d{3,}:\d+", raw_cadastral or "") else ""
     if not cadastral_number and fallback_cadastral:
@@ -2448,7 +2475,7 @@ def parse_right_line(value: Any) -> tuple[str, str, str, bool, str, str]:
     if not reg:
         # Регномер без №:
         # 26-26-12/059/2008-526
-        # 26:12:030101:1363-26/001/2017-2
+        # 00:00:000000:1002-00/001/2020-1
         # 26-0-1-117/2003/2013-71
         m = re.search(r"\b\d{2}(?:[:\-]\d{1,2}){1,3}[0-9:/\-.]*(?:[-/]\d+(?:\.\d+)*)+\b", raw)
         if m:
@@ -6286,9 +6313,55 @@ class ParserWorker(threading.Thread):
         self.log(f"  Погашенный КН {old_cad}: актуальная замена не найдена после {len(queries)} запросов.")
         return None
 
-    def _write_cadastral_queue_info(self, info: ObjectInfo, item: CadastralQueueItem, search_query: str) -> bool:
+    def _write_cadastral_queue_info(
+        self,
+        info: ObjectInfo,
+        item: CadastralQueueItem,
+        search_query: str,
+        result_row_text: str = "",
+    ) -> bool:
         assert self.excel is not None
-        info.flat_no = item.unit_no or info.flat_no or "."
+        queued_unit = clean_unit_number(item.unit_no)
+        card_unit = clean_unit_number(extract_flat_no(info.address or "")) or clean_unit_number(info.flat_no)
+        row_unit, row_address = cad_queue_unit_from_result_row(
+            result_row_text, item.cadastral_number
+        )
+        if not str(info.address or "").strip(" .") and row_address:
+            info.address = row_address
+
+        if not queued_unit and card_unit and row_unit and card_unit != row_unit:
+            info.flat_no = "."
+            self.log(
+                f"  КН {item.cadastral_number}: номера помещения противоречат друг другу: "
+                f"карточка {card_unit}, выдача {row_unit}. Требуется ручная проверка."
+            )
+            self.excel.append_disputed(
+                search_query, ".", item.cadastral_number, info.address or row_address or ".",
+                "Разные номера помещения",
+                f"В карточке {card_unit}, в выдаче {row_unit}; автоматически выбирать номер нельзя.",
+                item.cadastral_number,
+            )
+        else:
+            info.flat_no = queued_unit or card_unit or row_unit or "."
+            if not queued_unit and not card_unit and row_unit:
+                self.log(
+                    f"  Номер помещения {row_unit} восстановлен из адреса выдачи "
+                    f"для точного КН {item.cadastral_number}."
+                )
+            if not clean_unit_number(info.flat_no):
+                self.log(
+                    f"  КН {item.cadastral_number}: номер помещения не определён; "
+                    "строка будет записана с точкой и отметкой для ручной проверки."
+                )
+                self.excel.append_disputed(
+                    search_query, ".", item.cadastral_number,
+                    info.address or row_address or ".",
+                    "Номер помещения не определён",
+                    "Исходный список содержит только КН; в адресе карточки и "
+                    "строке выдачи номер помещения не обнаружен.",
+                    item.cadastral_number,
+                )
+
         if not info.cadastral_number or info.cadastral_number == ".":
             info.cadastral_number = item.cadastral_number
 
@@ -6347,19 +6420,8 @@ class ParserWorker(threading.Thread):
             self.metrics["Найдено помещений/квартир"] = self.metrics.get("Найдено помещений/квартир", 0) + 1
             return True
 
-        if bool(self.cfg.get("cadastral_queue_validate_address", True)):
-            addr_ok, addr_reason = self.cad_queue_address_soft_match(info.address or "", item.unit_no or info.flat_no or "")
-            if not addr_ok:
-                self.metrics["Спорных результатов"] = self.metrics.get("Спорных результатов", 0) + 1
-                self.excel.append_disputed(
-                    search_query,
-                    item.unit_no or ".",
-                    info.cadastral_number or item.cadastral_number,
-                    info.address,
-                    "Записан по точному КН",
-                    f"Адрес карточки не похож на адрес дома из поля «Адрес до номера»: {addr_reason}. Проверьте вручную.",
-                    info.cadastral_number or item.cadastral_number,
-                )
+        # В режиме точного КН адрес может относиться к другому населенному пункту.
+        # Адресные несовпадения сами по себе не считаются спорным результатом.
 
         if is_building_or_land(info.object_type):
             self.metrics["Зданий/участков"] = self.metrics.get("Зданий/участков", 0) + 1
@@ -6414,7 +6476,9 @@ class ParserWorker(threading.Thread):
                     info = self.open_candidate_and_parse(candidate, item.unit_no or ".", search_query)
                     if not info:
                         continue
-                    if self._write_cadastral_queue_info(info, item, search_query):
+                    if self._write_cadastral_queue_info(
+                        info, item, search_query, str(candidate.get("text") or "")
+                    ):
                         return
                     try:
                         self.back_to_results()
@@ -7890,7 +7954,7 @@ class App(tk.Tk):
                 self.cad_queue_status_var.set(
                     "Активен режим списка КН: обычный диапазон квартир, ручная очередь и поиск без номеров не используются. "
                     "Проверьте файл списка КН, выберите итоговый Excel и нажмите «Старт». "
-                    "Поле «Адрес до номера» можно оставить для проверки похожести адреса карточки."
+                    "Адрес до номера не ограничивает поиск по КН и может отличаться от адреса карточки."
                 )
             else:
                 self.cad_queue_status_var.set(
@@ -8040,13 +8104,6 @@ class App(tk.Tk):
             foreground="#555555",
             wraplength=900,
         ).grid(row=1, column=1, columnspan=5, sticky="w", pady=(0, 4))
-
-        self.cadastral_queue_validate_address_var = tk.BooleanVar(value=bool(self.cfg.get("cadastral_queue_validate_address", True)))
-        ttk.Checkbutton(
-            cad_queue_grid,
-            text="Предупреждать, если адрес карточки не похож на адрес дома",
-            variable=self.cadastral_queue_validate_address_var,
-        ).grid(row=2, column=1, columnspan=5, sticky="w", pady=2)
 
         advanced, _toggle_advanced = self._make_collapsible_section(frm, "Расширенные настройки парсинга ОСС", visible=False)
         advanced_grid = ttk.Frame(advanced)

@@ -64,6 +64,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
           .\.venv\Scripts\python.exe -m pip install -r requirements.txt -c .github/build-constraints.txt
           if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+      - name: Verify fictitious test data
+        shell: pwsh
+        run: |
+          python scripts/check_test_fixtures.py
+          if ($LASTEXITCODE -ne 0) { throw "Real-data fixture found" }
+      - name: Regression tests for cadastral queue
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_cad_queue_units.py -v
+          if ($LASTEXITCODE -ne 0) { throw "Cadastral queue regression tests failed" }
       - name: Build stable portable package
         shell: cmd
         run: call 02_BUILD_EXE.bat
