@@ -9,14 +9,14 @@ echo.
 if not exist "src\rosreestr_parser_app.py" (
   echo ERROR: src\rosreestr_parser_app.py not found.
   echo Run this BAT from repository root folder.
-  pause
+  if not defined CI pause
   exit /b 1
 )
 
 if not exist ".venv\Scripts\python.exe" (
   echo ERROR: virtual environment not found.
   echo Run 00_SETUP.bat first.
-  pause
+  if not defined CI pause
   exit /b 1
 )
 
@@ -117,7 +117,7 @@ echo.
 REM Remove PyInstaller temp build folder after success so it is not confused with the final program.
 if exist "build" rmdir /s /q "build"
 
-pause
+if not defined CI pause
 exit /b 0
 
 :FAIL
@@ -126,5 +126,5 @@ echo ERROR: EXE build failed.
 echo If a build folder exists, it is only diagnostic temporary files.
 echo The runnable program must be in dist\RosreestrParser.
 echo.
-pause
+if not defined CI pause
 exit /b 1

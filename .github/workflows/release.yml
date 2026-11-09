@@ -1,0 +1,98 @@
+name: Stable Release (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (example: v1.4)'
+        required: true
+        type: string
+      notes:
+        description: 'Changes in this version (one item per line)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_NOTES: ${{ inputs.notes }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout main with publish permission
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Validate requested release
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw "main changed after workflow started" }
+          python -m py_compile src/rosreestr_parser_app.py scripts/ci_tools.py
+          if ($LASTEXITCODE -ne 0) { throw "Python syntax error" }
+          python scripts/ci_tools.py check-source
+          if ($LASTEXITCODE -ne 0) { throw "Source validation failed" }
+          python scripts/ci_tools.py check-release --tag "$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw "Version mismatch" }
+          python scripts/ci_tools.py prepare-notes --tag "$env:RELEASE_TAG" --notes "$env:RELEASE_NOTES" --file release_notes.md
+          if ($LASTEXITCODE -ne 0) { throw "Release notes invalid" }
+          $tagRef = git ls-remote --tags origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw "Cannot check remote tags" }
+          if ($tagRef) { throw "This release tag already exists" }
+      - name: Set up isolated build environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { throw "Could not create virtual environment" }
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt -c .github/build-constraints.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+      - name: Build stable portable package
+        shell: cmd
+        run: call 02_BUILD_EXE.bat
+      - name: Verify ZIP content and SHA256
+        shell: pwsh
+        run: |
+          python scripts/ci_tools.py verify-zip --zip release_assets/rosreestr_parser.zip --sha-file release_assets/rosreestr_parser.sha256.txt
+          if ($LASTEXITCODE -ne 0) { throw "ZIP validation failed; aborting release" }
+      - name: Create draft release with ZIP
+        shell: pwsh
+        run: |
+          gh release create "$env:RELEASE_TAG" release_assets/rosreestr_parser.zip --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title "Парсер Росреестра — $env:RELEASE_TAG" --notes-file release_notes.md --draft
+          if ($LASTEXITCODE -ne 0) { throw "Could not create draft Release" }
+          $assets = @(gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          if ($LASTEXITCODE -ne 0 -or $assets -notcontains 'rosreestr_parser.zip') { throw "Release ZIP was not uploaded" }
+      - name: Publish stable Release
+        shell: pwsh
+        run: |
+          gh release edit "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --draft=false
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed; latest.json unchanged" }
+      - name: Update stable manifest LAST
+        shell: pwsh
+        run: |
+          python scripts/ci_tools.py make-manifest --tag "$env:RELEASE_TAG" --zip release_assets/rosreestr_parser.zip --notes-file release_notes.md
+          if ($LASTEXITCODE -ne 0) { throw "Manifest generation failed" }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest.json
+          git commit -m "release: publish manifest for $env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw "Manifest commit failed" }
+          git push origin HEAD:main
+          if ($LASTEXITCODE -ne 0) { throw "Release published but manifest push failed; fix latest.json only" }
