@@ -43,6 +43,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 APP_TITLE = "Парсер Росреестра — V1.3"
 APP_VERSION_CODE = 13
 
+# Public CloudTips donation page; do not store payment card details in source.
+SUPPORT_URL = "https://pay.cloudtips.ru/p/6b9c3555"
+
 REQUIRED_HEADERS = [
     "Номер помещения (обяз.)",
     "Площадь помещения, м2 (обяз.)",
@@ -8356,11 +8359,14 @@ class App(tk.Tk):
         self.about_text_content = info_text_plain
         self.about_text = None
 
-        support_frame = ttk.LabelFrame(frm, text="Поддержать проект", padding=(10, 8))
+        support_frame = ttk.LabelFrame(frm, text="Поддержать проект", padding=(12, 10))
         support_frame.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(support_frame, text="Номер карты:").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Label(support_frame, text="2202 2088 9799 2260").pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(support_frame, text="Скопировать номер карты", command=self.copy_donate_card).pack(side=tk.LEFT)
+        ttk.Label(
+            support_frame,
+            text="Если парсер вам полезен, вы можете поддержать его дальнейшую разработку.",
+            foreground="#53657A",
+        ).pack(anchor="w", pady=(0, 8))
+        self._build_cloudtips_banner(support_frame)
 
         self.about_menu = tk.Menu(self, tearoff=0)
         self.about_menu.add_command(label="Копировать всё", command=self.copy_about_text)
@@ -8720,9 +8726,83 @@ class App(tk.Tk):
             self.last_update_info = {}
             self.update_status_var.set(f"Не удалось проверить обновление: {e}")
 
-    def copy_donate_card(self) -> None:
-        self.clipboard_clear()
-        self.clipboard_append("2202208897992260")
+    def open_support_page(self) -> None:
+        """Open the publicly listed CloudTips donation page in the default browser."""
+        self.open_url_safe(SUPPORT_URL, "Ссылка на поддержку проекта не задана.")
+
+    def _build_cloudtips_banner(self, parent: ttk.Frame) -> None:
+        """Large responsive clickable banner without external image dependencies."""
+        banner = tk.Canvas(
+            parent,
+            height=104,
+            background="#F7FAFF",
+            borderwidth=0,
+            highlightthickness=0,
+            takefocus=1,
+            cursor="hand2",
+        )
+        banner.pack(fill=tk.X, expand=True)
+        self.cloudtips_banner = banner
+        banner_hovered = False
+        banner_focused = False
+
+        def draw() -> None:
+            w = max(460, banner.winfo_width())
+            banner.delete("all")
+            bg = "#EBF3FF" if banner_hovered else "#F7FAFF"
+            border = "#467DC8" if banner_hovered or banner_focused else "#C5D5E8"
+            banner.create_rectangle(
+                2, 2, w - 2, 102, fill=bg, outline=border, width=2,
+            )
+
+            # CloudTips-style two-stroke mark, drawn as native Tk shapes.
+            banner.create_oval(22, 22, 80, 80, fill="#5D96DF", outline="")
+            banner.create_line(
+                38, 59, 61, 36, fill="#FFFFFF", width=8, capstyle=tk.ROUND,
+            )
+            banner.create_line(
+                42, 66, 66, 42, fill="#BEDDFF", width=7, capstyle=tk.ROUND,
+            )
+            banner.create_text(
+                98, 37, anchor="w", text="CloudTips",
+                fill="#142F56", font=("Segoe UI", 18, "bold"),
+            )
+            banner.create_text(
+                98, 68, anchor="w", text="Поддержать проект",
+                fill="#435A77", font=("Segoe UI", 11),
+            )
+
+            action_left = w - 218
+            banner.create_rectangle(
+                action_left, 24, w - 22, 80,
+                fill="#367CC8" if banner_hovered else "#417FD0",
+                outline="",
+            )
+            banner.create_text(
+                (action_left + w - 22) // 2, 52,
+                text="Поддержать  ↗", fill="#FFFFFF",
+                font=("Segoe UI", 12, "bold"),
+            )
+
+        def set_hover(value: bool) -> None:
+            nonlocal banner_hovered
+            banner_hovered = value
+            draw()
+
+        def set_focus(value: bool) -> None:
+            nonlocal banner_focused
+            banner_focused = value
+            draw()
+
+        banner.bind("<Configure>", lambda _event: draw())
+        banner.bind("<Enter>", lambda _event: set_hover(True))
+        banner.bind("<Leave>", lambda _event: set_hover(False))
+        banner.bind("<FocusIn>", lambda _event: set_focus(True))
+        banner.bind("<FocusOut>", lambda _event: set_focus(False))
+        banner.bind("<Button-1>", lambda _event: (banner.focus_set(), self.open_support_page()))
+        banner.bind("<Return>", lambda _event: self.open_support_page())
+        banner.bind("<space>", lambda _event: self.open_support_page())
+        draw()
 
     def copy_about_text(self) -> None:
         parts: list[str] = []
