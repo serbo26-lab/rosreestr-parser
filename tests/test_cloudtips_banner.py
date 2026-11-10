@@ -79,6 +79,13 @@ class TestCloudTipsBanner(unittest.TestCase):
             canvas.handlers[event](None)
         self.assertEqual(opened, ["opened", "opened", "opened"])
 
+    def test_support_section_follows_updates(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        updates = source.index('update_frame = ttk.LabelFrame(frm, text="Обновления и репозиторий"')
+        support = source.index('support_frame = ttk.LabelFrame(frm, text="Поддержать проект"')
+        self.assertLess(updates, support)
+        self.assertEqual(source.count('self._build_cloudtips_banner(support_frame)'), 1)
+
     def test_no_donation_card_details_are_shipped(self):
         source = SOURCE.read_text(encoding="utf-8")
         self.assertNotIn("copy_donate_card", source)
