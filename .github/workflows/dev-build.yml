@@ -53,11 +53,11 @@ jobs:
         run: |
           python scripts/check_test_fixtures.py
           if ($LASTEXITCODE -ne 0) { throw "Real-data fixture found" }
-      - name: Regression tests for cadastral queue
+      - name: Regression tests for cadastral queue, updates and CloudTips
         shell: pwsh
         run: |
-          .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_cad_queue_units.py -v
-          if ($LASTEXITCODE -ne 0) { throw "Cadastral queue regression tests failed" }
+          .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
+          if ($LASTEXITCODE -ne 0) { throw "Regression tests failed" }
       - name: Stamp DEV title and disable stable updates
         shell: pwsh
         run: |
