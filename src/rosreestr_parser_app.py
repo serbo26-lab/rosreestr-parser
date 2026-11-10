@@ -4433,6 +4433,19 @@ class ExcelOutput:
             reason,
         ])
 
+    def set_cadastral_queue_search_unit(self, search_cad: str, result_cad: str, flat_no: str) -> bool:
+        """Update accepted diagnostic search row with the final unit number."""
+        ws = getattr(self, "search_ws", None)
+        if ws is None:
+            return False
+        for row_idx in range(ws.max_row, 1, -1):
+            if (str(ws.cell(row_idx, 2).value or "") == search_cad
+                    and str(ws.cell(row_idx, 4).value or "") == result_cad
+                    and str(ws.cell(row_idx, 6).value or "") == "Принят к открытию"):
+                ws.cell(row_idx, 3).value = flat_no or "."
+                return True
+        return False
+
     def append_disputed(self, search_address: str, flat_no: str, cad: str, row_text: str, action: str, reason: str, chosen_cad: str = "") -> None:
         self._append_row(self.disputed_ws, [
             datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
@@ -6416,6 +6429,9 @@ class ParserWorker(threading.Thread):
             except Exception:
                 pass
 
+            self.excel.set_cadastral_queue_search_unit(
+                item.cadastral_number, item.cadastral_number, info.flat_no
+            )
             self.write_object_rows(info)
             self.metrics["Найдено помещений/квартир"] = self.metrics.get("Найдено помещений/квартир", 0) + 1
             return True
@@ -6429,6 +6445,9 @@ class ParserWorker(threading.Thread):
             self.excel.append_error(item.unit_no or ".", search_query, "Не помещение", "По КН найден объект типа здание/земельный участок; перенесён на служебный лист", item.cadastral_number, info.address)
             return False
 
+        self.excel.set_cadastral_queue_search_unit(
+            item.cadastral_number, item.cadastral_number, info.flat_no
+        )
         self.write_object_rows(info)
         self.metrics["Найдено помещений/квартир"] = self.metrics.get("Найдено помещений/квартир", 0) + 1
         return True
