@@ -40,8 +40,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
-APP_TITLE = "Парсер Росреестра — V1.3"
-APP_VERSION_CODE = 13
+APP_TITLE = "Парсер Росреестра — V1.4"
+APP_VERSION_CODE = 14
 
 # Public CloudTips donation page; do not store payment card details in source.
 SUPPORT_URL = "https://pay.cloudtips.ru/p/6b9c3555"
