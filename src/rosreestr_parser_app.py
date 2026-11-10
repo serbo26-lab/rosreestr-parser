@@ -8359,15 +8359,6 @@ class App(tk.Tk):
         self.about_text_content = info_text_plain
         self.about_text = None
 
-        support_frame = ttk.LabelFrame(frm, text="Поддержать проект", padding=(12, 10))
-        support_frame.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(
-            support_frame,
-            text="Если парсер вам полезен, вы можете поддержать его дальнейшую разработку.",
-            foreground="#53657A",
-        ).pack(anchor="w", pady=(0, 8))
-        self._build_cloudtips_banner(support_frame)
-
         self.about_menu = tk.Menu(self, tearoff=0)
         self.about_menu.add_command(label="Копировать всё", command=self.copy_about_text)
 
@@ -8393,6 +8384,15 @@ class App(tk.Tk):
         update_frame.columnconfigure(3, weight=1)
 
         self.last_update_info: dict[str, Any] = {}
+
+        support_frame = ttk.LabelFrame(frm, text="Поддержать проект", padding=(12, 10))
+        support_frame.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(
+            support_frame,
+            text="Если парсер вам полезен, вы можете поддержать его дальнейшую разработку.",
+            foreground="#53657A",
+        ).pack(anchor="w", pady=(0, 8))
+        self._build_cloudtips_banner(support_frame)
 
     def _download_update_archive(self, info: dict[str, Any]) -> tuple[Path, str]:
         download_url = str(info.get("download_url") or "").strip()
