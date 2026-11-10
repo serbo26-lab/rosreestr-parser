@@ -143,5 +143,107 @@ class TestCadastralQueueNumbers(unittest.TestCase):
 
 
 
+class TestStartupUpdateCheck(unittest.TestCase):
+    """No external network, no real data, no Tk display required."""
+
+    def manifest(self, version=14, channel="stable", checksum=None):
+        return {
+            "latest_version": "V1.4",
+            "version_code": version,
+            "channel": channel,
+            "download_url": "https://example.invalid/releases/download/v1.4/rosreestr_parser.zip",
+            "sha256": checksum if checksum is not None else "a" * 64,
+        }
+
+    def fake_app(self, channel="stable"):
+        from types import SimpleNamespace
+        state = {"messages": [], "schedules": [], "installations": []}
+        fake = SimpleNamespace(
+            cfg={
+                "update_manifest_url": "https://example.invalid/latest.json",
+                "update_channel": channel,
+            },
+            last_update_info={},
+            update_status_var=SimpleNamespace(set=lambda value: state["messages"].append(value)),
+            after=lambda ms, callback: state["schedules"].append((ms, callback)),
+            download_and_install_update=lambda **kw: state["installations"].append(kw),
+        )
+        fake._poll_startup_update_result = lambda: app.App._poll_startup_update_result(fake)
+        return fake, state
+
+    def test_only_new_stable_downloadable_release_qualifies(self):
+        self.assertIsNone(app.valid_new_stable_release(self.manifest(version=13), 13))
+        self.assertIsNone(app.valid_new_stable_release(self.manifest(version=12), 13))
+        self.assertIsNone(app.valid_new_stable_release(self.manifest(channel="dev"), 13))
+        self.assertIsNone(app.valid_new_stable_release(self.manifest(checksum="bad"), 13))
+        self.assertIsNone(app.valid_new_stable_release({"version_code": 14}, 13))
+        self.assertEqual(
+            app.valid_new_stable_release(self.manifest(), 13)["version_code"], 14
+        )
+
+    def test_silent_when_no_update_found(self):
+        from unittest import mock
+        from queue import Queue
+        fake, state = self.fake_app()
+        fake._startup_update_results = Queue()
+        fake._startup_update_results.put(None)
+        with mock.patch.object(app.messagebox, "askyesno") as prompt:
+            app.App._poll_startup_update_result(fake)
+        prompt.assert_not_called()
+        self.assertEqual(state["messages"], [])
+        self.assertEqual(state["installations"], [])
+
+    def test_new_release_prompts_once_and_installs_without_second_confirmation(self):
+        from unittest import mock
+        from queue import Queue
+        fake, state = self.fake_app()
+        fake._startup_update_results = Queue()
+        fake._startup_update_results.put(self.manifest())
+        with mock.patch.object(app.messagebox, "askyesno", return_value=True) as prompt:
+            app.App._poll_startup_update_result(fake)
+        prompt.assert_called_once()
+        self.assertEqual(state["installations"], [{"confirmed": True}])
+        self.assertEqual(fake.last_update_info["version_code"], 14)
+
+    def test_decline_keeps_running_without_download(self):
+        from unittest import mock
+        from queue import Queue
+        fake, state = self.fake_app()
+        fake._startup_update_results = Queue()
+        fake._startup_update_results.put(self.manifest())
+        with mock.patch.object(app.messagebox, "askyesno", return_value=False) as prompt:
+            app.App._poll_startup_update_result(fake)
+        prompt.assert_called_once()
+        self.assertEqual(state["installations"], [])
+
+    def test_dev_channel_skips_network_check(self):
+        from unittest import mock
+        fake, state = self.fake_app(channel="dev")
+        with mock.patch.object(app.sys, "frozen", True, create=True):
+            with mock.patch.object(app.urllib.request, "urlopen") as network:
+                app.App._check_update_after_launch(fake)
+        network.assert_not_called()
+        self.assertEqual(state["schedules"], [])
+
+    def test_startup_fetch_runs_silently_in_background(self):
+        import io
+        import json
+        from unittest import mock
+        fake, state = self.fake_app()
+        payload = json.dumps(self.manifest(version=13)).encode("utf-8")
+        with mock.patch.object(app.sys, "frozen", True, create=True):
+            with mock.patch.object(
+                app.urllib.request, "urlopen",
+                side_effect=lambda request, timeout: io.BytesIO(payload),
+            ) as network:
+                app.App._check_update_after_launch(fake)
+                candidate = fake._startup_update_results.get(timeout=5)
+        self.assertIsNone(candidate)
+        self.assertTrue(network.called)
+        self.assertEqual(state["messages"], [])
+        self.assertEqual(state["installations"], [])
+
+
+
 if __name__ == "__main__":
     unittest.main()
