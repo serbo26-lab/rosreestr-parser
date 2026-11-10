@@ -7592,6 +7592,25 @@ def update_snt_registry_files(
     wb_old.save(output_path)
     return total_stats
 
+def valid_new_stable_release(manifest: Any, current_version_code: int) -> dict[str, Any] | None:
+    """Only prompt for a newer, downloadable stable release."""
+    if not isinstance(manifest, dict):
+        return None
+    if str(manifest.get("channel") or "stable").strip().lower() != "stable":
+        return None
+    try:
+        latest_code = int(manifest.get("version_code") or 0)
+    except (ValueError, TypeError):
+        return None
+    if latest_code <= current_version_code:
+        return None
+    download_url = str(manifest.get("download_url") or "").strip()
+    checksum = str(manifest.get("sha256") or "").strip().lower()
+    if not download_url.startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        return None
+    return dict(manifest)
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -7618,6 +7637,8 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_action_buttons()
         self.after(200, self._drain_log_queue)
+        # Automatic stable update check never blocks the main window.
+        self.after(1000, self._check_update_after_launch)
 
     def _make_scrollable_tab(self, notebook: ttk.Notebook, title: str) -> ttk.Frame:
         """Создаёт вкладку с вертикальной прокруткой и прокруткой колесом мыши."""
@@ -8480,7 +8501,7 @@ class App(tk.Tk):
         bat_path.write_text("\n".join(bat_lines) + "\n", encoding="utf-8")
         return bat_path
 
-    def download_and_install_update(self) -> None:
+    def download_and_install_update(self, *, confirmed: bool = False) -> None:
         info = getattr(self, "last_update_info", {}) or {}
         if not info:
             self.update_status_var.set("Сначала нажмите «Проверить обновление».")
@@ -8511,16 +8532,17 @@ class App(tk.Tk):
             self.download_update_zip()
             return
 
-        ok = messagebox.askyesno(
-            APP_TITLE,
-            "Скачать и установить обновление?\n\n"
-            f"Текущая версия: {APP_TITLE}\n"
-            f"Новая версия: {latest_version or latest_code}\n\n"
-            "Программа будет закрыта, файлы программы будут обновлены, затем новая версия запустится автоматически.\n\n"
-            "Не будут перезаписаны: config.json, результаты, прогресс, профили, профиль браузера и скачанные обновления.",
-        )
-        if not ok:
-            return
+        if not confirmed:
+            ok = messagebox.askyesno(
+                APP_TITLE,
+                "Скачать и установить обновление?\n\n"
+                f"Текущая версия: {APP_TITLE}\n"
+                f"Новая версия: {latest_version or latest_code}\n\n"
+                "Программа будет закрыта, файлы программы будут обновлены, затем новая версия запустится автоматически.\n\n"
+                "Не будут перезаписаны: config.json, результаты, прогресс, профили, профиль браузера и скачанные обновления.",
+            )
+            if not ok:
+                return
 
         try:
             zip_path, actual_sha = self._download_update_archive(info)
@@ -8584,6 +8606,56 @@ class App(tk.Tk):
                 webbrowser.open(path.as_uri())
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Не удалось открыть config.json:\n{e}")
+
+    def _check_update_after_launch(self) -> None:
+        """Check once per EXE launch. No UI change when offline or up to date."""
+        url = str(self.cfg.get("update_manifest_url") or "").strip()
+        channel = str(self.cfg.get("update_channel") or "stable").strip().lower()
+        if (not getattr(sys, "frozen", False) or channel != "stable"
+                or " DEV " in APP_TITLE or not url):
+            return
+
+        self._startup_update_results: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=1)
+
+        def fetch() -> None:
+            newer: dict[str, Any] | None = None
+            try:
+                request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+                with urllib.request.urlopen(request, timeout=7) as response:
+                    payload = response.read(65537)
+                if len(payload) <= 65536:
+                    manifest = json.loads(payload.decode("utf-8-sig"))
+                    newer = valid_new_stable_release(manifest, APP_VERSION_CODE)
+            except Exception:
+                pass  # Silent failure: no notification for network errors.
+            self._startup_update_results.put(newer)
+
+        threading.Thread(target=fetch, name="startup-update-check", daemon=True).start()
+        self.after(250, self._poll_startup_update_result)
+
+    def _poll_startup_update_result(self) -> None:
+        try:
+            newer = self._startup_update_results.get_nowait()
+        except queue.Empty:
+            self.after(250, self._poll_startup_update_result)
+            return
+        if newer is None:
+            return
+
+        # Tk widgets and messageboxes only from the main UI thread.
+        self.last_update_info = newer
+        version = str(newer.get("latest_version") or newer.get("version") or newer["version_code"])
+        self.update_status_var.set(
+            f"Доступна новая версия: {version}. Можно скачать и установить обновление."
+        )
+        if messagebox.askyesno(
+            APP_TITLE,
+            f"Доступна новая версия: {version}.\n"
+            f"Установленная версия: {APP_TITLE}.\n\n"
+            "Скачать и установить обновление сейчас?\n\n"
+            "Результаты, настройки и профили будут сохранены.",
+        ):
+            self.download_and_install_update(confirmed=True)
 
     def _version_code_from_text(self, value: Any) -> int:
         if value is None:
