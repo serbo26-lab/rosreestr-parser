@@ -19,6 +19,11 @@ class _Excel:
     def __init__(self):
         self.disputed = []
         self.errors = []
+        self.updated_search_units = []
+
+    def set_cadastral_queue_search_unit(self, search_cad, result_cad, unit_no):
+        self.updated_search_units.append((search_cad, result_cad, unit_no))
+        return True
 
     def append_disputed(self, *values):
         self.disputed.append(values)
@@ -68,6 +73,7 @@ class TestCadastralQueueNumbers(unittest.TestCase):
         ))
         self.assertEqual(output[0][0], "1")
         self.assertEqual(worker.excel.disputed, [])
+        self.assertEqual(worker.excel.updated_search_units, [(cad, cad, "1")])
 
     def test_room_34_other_locality_is_not_an_error(self):
         cad = "00:00:000000:1002"
@@ -114,6 +120,27 @@ class TestCadastralQueueNumbers(unittest.TestCase):
         self.assertEqual(output[0][0], ".")
         self.assertEqual(len(worker.excel.disputed), 1)
         self.assertEqual(worker.excel.disputed[0][4], "Разные номера помещения")
+
+    def test_diagnostic_row_targets_only_accepted_exact_kn(self):
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Дата", "Поиск", "Помещение", "КН", "Текст", "Решение", "Причина"])
+        ws.append(["-", "00:00:000000:1003", ".", "00:00:000000:1003", "", "Принят к открытию", ""])
+        ws.append(["-", "00:00:000000:1001", ".", "00:00:000000:1001", "", "Отклонён", ""])
+        ws.append(["-", "00:00:000000:1001", ".", "00:00:000000:1001", "", "Принят к открытию", ""])
+        writer = app.ExcelOutput.__new__(app.ExcelOutput)
+        writer.search_ws = ws
+        self.assertTrue(writer.set_cadastral_queue_search_unit(
+            "00:00:000000:1001", "00:00:000000:1001", "12/1"
+        ))
+        self.assertEqual(ws["C4"].value, "12/1")
+        self.assertEqual(ws["C2"].value, ".")
+        self.assertEqual(ws["C3"].value, ".")
+        self.assertFalse(writer.set_cadastral_queue_search_unit(
+            "00:00:000000:1002", "00:00:000000:1002", "34"
+        ))
+
 
 
 if __name__ == "__main__":
