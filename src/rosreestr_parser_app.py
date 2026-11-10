@@ -40,8 +40,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
-APP_TITLE = "Парсер Росреестра — V1.3"
-APP_VERSION_CODE = 13
+APP_TITLE = "Парсер Росреестра — V1.4"
+APP_VERSION_CODE = 14
+
+# Public CloudTips donation page; do not store payment card details in source.
+SUPPORT_URL = "https://pay.cloudtips.ru/p/6b9c3555"
 
 REQUIRED_HEADERS = [
     "Номер помещения (обяз.)",
@@ -479,6 +482,33 @@ def extract_flat_no(address: str) -> str:
     return ""
 
 
+def cad_queue_unit_from_result_row(row_text: Any, target_cadastral: str) -> tuple[str, str]:
+    """
+    В режиме списка КН восстанавливает номер помещения из адреса строки
+    выдачи, содержащей именно искомый КН. Порядок строк Excel не используется.
+    """
+    source = str(row_text or "")
+    target = clean_cadastral_number(target_cadastral)
+    if not target or clean_cadastral_number(source) != target:
+        return "", ""
+
+    for raw_line in source.splitlines():
+        address = re.sub(r"\s+", " ", raw_line).strip()
+        unit = clean_unit_number(extract_flat_no(address))
+        if not unit:
+            continue
+        # Строка "Помещение 2" без адреса не является номером квартиры.
+        if not re.search(
+            r"(?<![а-яa-z])(?:ул\.?|улица|д\.?|дом|пер\.?|переулок|"
+            r"просп\.?|проспект|пр-кт|проезд|шоссе|бульвар)"
+            r"(?=[\s,])",
+            normalize_text(address),
+        ):
+            continue
+        return unit, address
+    return "", ""
+
+
 def address_has_trailing_unit(address: str, expected_no: str, search_house_no: str = "") -> bool:
     """
     Понимает редкий формат адреса без маркера помещения: '..., д 66, 1'.
@@ -549,7 +579,7 @@ def extract_house_no(address: str) -> str:
 
     Сначала ищем явный маркер д/дом.
     Затем fallback для адресов без слова "улица", например:
-    "Ставрополь, Братский, 7, кв 7" — дом 7, квартира 7.
+    "Тестоград, Макетная, 7, кв 7" — дом 7, квартира 7.
 
     Это важно: иначе строгая проверка дома не работает для коротких адресов,
     и поиск может принять "Братский, д 12, кв 7" как подходящий результат
@@ -902,7 +932,7 @@ def extract_explicit_settlement(address: Any) -> str:
 
 
 def extract_query_settlement(address: Any) -> str:
-    """Населённый пункт из пользовательского запроса. Поддерживает и короткое: 'Ставрополь, Братский, 7, кв 1'."""
+    """Населённый пункт из пользовательского запроса. Поддерживает и короткое: 'Тестоград, Макетная, 7, кв 1'."""
     explicit = extract_explicit_settlement(address)
     if explicit:
         return explicit
@@ -915,7 +945,7 @@ def extract_query_settlement(address: Any) -> str:
     # Если первый фрагмент уже похож на улицу/дом, город явно не задан.
     if re.search(r"\b(ул\.?|улица|проспект|проезд|пер\.?|переулок|д\.?|дом|снт|днт|дск|ст|с/т)\b", first, flags=re.I):
         return ""
-    # Короткий адрес часто начинается с города: 'Ставрополь, Братский, 7, кв 1'.
+    # Короткий адрес часто начинается с города: 'Тестоград, Макетная, 7, кв 1'.
     if re.search(r"[а-яa-zё]", first, flags=re.I) and not re.search(r"\d", first):
         return _clean_place_name(first)
     return ""
@@ -924,7 +954,7 @@ def extract_query_settlement(address: Any) -> str:
 def settlement_matches(search_address_or_city: Any, result_address: Any) -> bool:
     """
     Проверяет именно населённый пункт, а не регион.
-    Важно: 'Ставрополь' не должен совпадать только с 'Ставропольский край'.
+    Важно: 'Тестоград' не должен совпадать только с 'Тестоградская область'.
     """
     q = extract_query_settlement(search_address_or_city)
     if not q:
@@ -2198,7 +2228,7 @@ def parse_card_text(text: str, fallback_flat: str, fallback_cadastral: str = "")
     # На странице в DOM иногда остаётся поисковая форма с подписью
     # "Адрес или кадастровый номер". Старый разбор мог принять текст
     # "Адрес или" за кадастровый номер. Поэтому кадастровый номер
-    # считаем валидным только если он реально похож на 26:12:030108:985.
+    # считаем валидным только если он реально похож на 00:00:000000:1001.
     raw_cadastral = find_line_value(lines, "Кадастровый номер")
     cadastral_number = raw_cadastral if re.fullmatch(r"\d{2}:\d{2}:\d{3,}:\d+", raw_cadastral or "") else ""
     if not cadastral_number and fallback_cadastral:
@@ -2448,7 +2478,7 @@ def parse_right_line(value: Any) -> tuple[str, str, str, bool, str, str]:
     if not reg:
         # Регномер без №:
         # 26-26-12/059/2008-526
-        # 26:12:030101:1363-26/001/2017-2
+        # 00:00:000000:1002-00/001/2020-1
         # 26-0-1-117/2003/2013-71
         m = re.search(r"\b\d{2}(?:[:\-]\d{1,2}){1,3}[0-9:/\-.]*(?:[-/]\d+(?:\.\d+)*)+\b", raw)
         if m:
@@ -4406,6 +4436,19 @@ class ExcelOutput:
             reason,
         ])
 
+    def set_cadastral_queue_search_unit(self, search_cad: str, result_cad: str, flat_no: str) -> bool:
+        """Update accepted diagnostic search row with the final unit number."""
+        ws = getattr(self, "search_ws", None)
+        if ws is None:
+            return False
+        for row_idx in range(ws.max_row, 1, -1):
+            if (str(ws.cell(row_idx, 2).value or "") == search_cad
+                    and str(ws.cell(row_idx, 4).value or "") == result_cad
+                    and str(ws.cell(row_idx, 6).value or "") == "Принят к открытию"):
+                ws.cell(row_idx, 3).value = flat_no or "."
+                return True
+        return False
+
     def append_disputed(self, search_address: str, flat_no: str, cad: str, row_text: str, action: str, reason: str, chosen_cad: str = "") -> None:
         self._append_row(self.disputed_ws, [
             datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
@@ -6286,9 +6329,55 @@ class ParserWorker(threading.Thread):
         self.log(f"  Погашенный КН {old_cad}: актуальная замена не найдена после {len(queries)} запросов.")
         return None
 
-    def _write_cadastral_queue_info(self, info: ObjectInfo, item: CadastralQueueItem, search_query: str) -> bool:
+    def _write_cadastral_queue_info(
+        self,
+        info: ObjectInfo,
+        item: CadastralQueueItem,
+        search_query: str,
+        result_row_text: str = "",
+    ) -> bool:
         assert self.excel is not None
-        info.flat_no = item.unit_no or info.flat_no or "."
+        queued_unit = clean_unit_number(item.unit_no)
+        card_unit = clean_unit_number(extract_flat_no(info.address or "")) or clean_unit_number(info.flat_no)
+        row_unit, row_address = cad_queue_unit_from_result_row(
+            result_row_text, item.cadastral_number
+        )
+        if not str(info.address or "").strip(" .") and row_address:
+            info.address = row_address
+
+        if not queued_unit and card_unit and row_unit and card_unit != row_unit:
+            info.flat_no = "."
+            self.log(
+                f"  КН {item.cadastral_number}: номера помещения противоречат друг другу: "
+                f"карточка {card_unit}, выдача {row_unit}. Требуется ручная проверка."
+            )
+            self.excel.append_disputed(
+                search_query, ".", item.cadastral_number, info.address or row_address or ".",
+                "Разные номера помещения",
+                f"В карточке {card_unit}, в выдаче {row_unit}; автоматически выбирать номер нельзя.",
+                item.cadastral_number,
+            )
+        else:
+            info.flat_no = queued_unit or card_unit or row_unit or "."
+            if not queued_unit and not card_unit and row_unit:
+                self.log(
+                    f"  Номер помещения {row_unit} восстановлен из адреса выдачи "
+                    f"для точного КН {item.cadastral_number}."
+                )
+            if not clean_unit_number(info.flat_no):
+                self.log(
+                    f"  КН {item.cadastral_number}: номер помещения не определён; "
+                    "строка будет записана с точкой и отметкой для ручной проверки."
+                )
+                self.excel.append_disputed(
+                    search_query, ".", item.cadastral_number,
+                    info.address or row_address or ".",
+                    "Номер помещения не определён",
+                    "Исходный список содержит только КН; в адресе карточки и "
+                    "строке выдачи номер помещения не обнаружен.",
+                    item.cadastral_number,
+                )
+
         if not info.cadastral_number or info.cadastral_number == ".":
             info.cadastral_number = item.cadastral_number
 
@@ -6343,23 +6432,15 @@ class ParserWorker(threading.Thread):
             except Exception:
                 pass
 
+            self.excel.set_cadastral_queue_search_unit(
+                item.cadastral_number, item.cadastral_number, info.flat_no
+            )
             self.write_object_rows(info)
             self.metrics["Найдено помещений/квартир"] = self.metrics.get("Найдено помещений/квартир", 0) + 1
             return True
 
-        if bool(self.cfg.get("cadastral_queue_validate_address", True)):
-            addr_ok, addr_reason = self.cad_queue_address_soft_match(info.address or "", item.unit_no or info.flat_no or "")
-            if not addr_ok:
-                self.metrics["Спорных результатов"] = self.metrics.get("Спорных результатов", 0) + 1
-                self.excel.append_disputed(
-                    search_query,
-                    item.unit_no or ".",
-                    info.cadastral_number or item.cadastral_number,
-                    info.address,
-                    "Записан по точному КН",
-                    f"Адрес карточки не похож на адрес дома из поля «Адрес до номера»: {addr_reason}. Проверьте вручную.",
-                    info.cadastral_number or item.cadastral_number,
-                )
+        # В режиме точного КН адрес может относиться к другому населенному пункту.
+        # Адресные несовпадения сами по себе не считаются спорным результатом.
 
         if is_building_or_land(info.object_type):
             self.metrics["Зданий/участков"] = self.metrics.get("Зданий/участков", 0) + 1
@@ -6367,6 +6448,9 @@ class ParserWorker(threading.Thread):
             self.excel.append_error(item.unit_no or ".", search_query, "Не помещение", "По КН найден объект типа здание/земельный участок; перенесён на служебный лист", item.cadastral_number, info.address)
             return False
 
+        self.excel.set_cadastral_queue_search_unit(
+            item.cadastral_number, item.cadastral_number, info.flat_no
+        )
         self.write_object_rows(info)
         self.metrics["Найдено помещений/квартир"] = self.metrics.get("Найдено помещений/квартир", 0) + 1
         return True
@@ -6414,7 +6498,9 @@ class ParserWorker(threading.Thread):
                     info = self.open_candidate_and_parse(candidate, item.unit_no or ".", search_query)
                     if not info:
                         continue
-                    if self._write_cadastral_queue_info(info, item, search_query):
+                    if self._write_cadastral_queue_info(
+                        info, item, search_query, str(candidate.get("text") or "")
+                    ):
                         return
                     try:
                         self.back_to_results()
@@ -7528,6 +7614,25 @@ def update_snt_registry_files(
     wb_old.save(output_path)
     return total_stats
 
+def valid_new_stable_release(manifest: Any, current_version_code: int) -> dict[str, Any] | None:
+    """Only prompt for a newer, downloadable stable release."""
+    if not isinstance(manifest, dict):
+        return None
+    if str(manifest.get("channel") or "stable").strip().lower() != "stable":
+        return None
+    try:
+        latest_code = int(manifest.get("version_code") or 0)
+    except (ValueError, TypeError):
+        return None
+    if latest_code <= current_version_code:
+        return None
+    download_url = str(manifest.get("download_url") or "").strip()
+    checksum = str(manifest.get("sha256") or "").strip().lower()
+    if not download_url.startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        return None
+    return dict(manifest)
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -7554,6 +7659,8 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_action_buttons()
         self.after(200, self._drain_log_queue)
+        # Automatic stable update check never blocks the main window.
+        self.after(1000, self._check_update_after_launch)
 
     def _make_scrollable_tab(self, notebook: ttk.Notebook, title: str) -> ttk.Frame:
         """Создаёт вкладку с вертикальной прокруткой и прокруткой колесом мыши."""
@@ -7890,7 +7997,7 @@ class App(tk.Tk):
                 self.cad_queue_status_var.set(
                     "Активен режим списка КН: обычный диапазон квартир, ручная очередь и поиск без номеров не используются. "
                     "Проверьте файл списка КН, выберите итоговый Excel и нажмите «Старт». "
-                    "Поле «Адрес до номера» можно оставить для проверки похожести адреса карточки."
+                    "Адрес до номера не ограничивает поиск по КН и может отличаться от адреса карточки."
                 )
             else:
                 self.cad_queue_status_var.set(
@@ -8040,13 +8147,6 @@ class App(tk.Tk):
             foreground="#555555",
             wraplength=900,
         ).grid(row=1, column=1, columnspan=5, sticky="w", pady=(0, 4))
-
-        self.cadastral_queue_validate_address_var = tk.BooleanVar(value=bool(self.cfg.get("cadastral_queue_validate_address", True)))
-        ttk.Checkbutton(
-            cad_queue_grid,
-            text="Предупреждать, если адрес карточки не похож на адрес дома",
-            variable=self.cadastral_queue_validate_address_var,
-        ).grid(row=2, column=1, columnspan=5, sticky="w", pady=2)
 
         advanced, _toggle_advanced = self._make_collapsible_section(frm, "Расширенные настройки парсинга ОСС", visible=False)
         advanced_grid = ttk.Frame(advanced)
@@ -8259,12 +8359,6 @@ class App(tk.Tk):
         self.about_text_content = info_text_plain
         self.about_text = None
 
-        support_frame = ttk.LabelFrame(frm, text="Поддержать проект", padding=(10, 8))
-        support_frame.pack(fill=tk.X, pady=(0, 12))
-        ttk.Label(support_frame, text="Номер карты:").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Label(support_frame, text="2202 2088 9799 2260").pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(support_frame, text="Скопировать номер карты", command=self.copy_donate_card).pack(side=tk.LEFT)
-
         self.about_menu = tk.Menu(self, tearoff=0)
         self.about_menu.add_command(label="Копировать всё", command=self.copy_about_text)
 
@@ -8290,6 +8384,15 @@ class App(tk.Tk):
         update_frame.columnconfigure(3, weight=1)
 
         self.last_update_info: dict[str, Any] = {}
+
+        support_frame = ttk.LabelFrame(frm, text="Поддержать проект", padding=(12, 10))
+        support_frame.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(
+            support_frame,
+            text="Если парсер вам полезен, вы можете поддержать его дальнейшую разработку.",
+            foreground="#53657A",
+        ).pack(anchor="w", pady=(0, 8))
+        self._build_cloudtips_banner(support_frame)
 
     def _download_update_archive(self, info: dict[str, Any]) -> tuple[Path, str]:
         download_url = str(info.get("download_url") or "").strip()
@@ -8423,7 +8526,7 @@ class App(tk.Tk):
         bat_path.write_text("\n".join(bat_lines) + "\n", encoding="utf-8")
         return bat_path
 
-    def download_and_install_update(self) -> None:
+    def download_and_install_update(self, *, confirmed: bool = False) -> None:
         info = getattr(self, "last_update_info", {}) or {}
         if not info:
             self.update_status_var.set("Сначала нажмите «Проверить обновление».")
@@ -8454,16 +8557,17 @@ class App(tk.Tk):
             self.download_update_zip()
             return
 
-        ok = messagebox.askyesno(
-            APP_TITLE,
-            "Скачать и установить обновление?\n\n"
-            f"Текущая версия: {APP_TITLE}\n"
-            f"Новая версия: {latest_version or latest_code}\n\n"
-            "Программа будет закрыта, файлы программы будут обновлены, затем новая версия запустится автоматически.\n\n"
-            "Не будут перезаписаны: config.json, результаты, прогресс, профили, профиль браузера и скачанные обновления.",
-        )
-        if not ok:
-            return
+        if not confirmed:
+            ok = messagebox.askyesno(
+                APP_TITLE,
+                "Скачать и установить обновление?\n\n"
+                f"Текущая версия: {APP_TITLE}\n"
+                f"Новая версия: {latest_version or latest_code}\n\n"
+                "Программа будет закрыта, файлы программы будут обновлены, затем новая версия запустится автоматически.\n\n"
+                "Не будут перезаписаны: config.json, результаты, прогресс, профили, профиль браузера и скачанные обновления.",
+            )
+            if not ok:
+                return
 
         try:
             zip_path, actual_sha = self._download_update_archive(info)
@@ -8528,6 +8632,56 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Не удалось открыть config.json:\n{e}")
 
+    def _check_update_after_launch(self) -> None:
+        """Check once per EXE launch. No UI change when offline or up to date."""
+        url = str(self.cfg.get("update_manifest_url") or "").strip()
+        channel = str(self.cfg.get("update_channel") or "stable").strip().lower()
+        if (not getattr(sys, "frozen", False) or channel != "stable"
+                or " DEV " in APP_TITLE or not url):
+            return
+
+        self._startup_update_results: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=1)
+
+        def fetch() -> None:
+            newer: dict[str, Any] | None = None
+            try:
+                request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+                with urllib.request.urlopen(request, timeout=7) as response:
+                    payload = response.read(65537)
+                if len(payload) <= 65536:
+                    manifest = json.loads(payload.decode("utf-8-sig"))
+                    newer = valid_new_stable_release(manifest, APP_VERSION_CODE)
+            except Exception:
+                pass  # Silent failure: no notification for network errors.
+            self._startup_update_results.put(newer)
+
+        threading.Thread(target=fetch, name="startup-update-check", daemon=True).start()
+        self.after(250, self._poll_startup_update_result)
+
+    def _poll_startup_update_result(self) -> None:
+        try:
+            newer = self._startup_update_results.get_nowait()
+        except queue.Empty:
+            self.after(250, self._poll_startup_update_result)
+            return
+        if newer is None:
+            return
+
+        # Tk widgets and messageboxes only from the main UI thread.
+        self.last_update_info = newer
+        version = str(newer.get("latest_version") or newer.get("version") or newer["version_code"])
+        self.update_status_var.set(
+            f"Доступна новая версия: {version}. Можно скачать и установить обновление."
+        )
+        if messagebox.askyesno(
+            APP_TITLE,
+            f"Доступна новая версия: {version}.\n"
+            f"Установленная версия: {APP_TITLE}.\n\n"
+            "Скачать и установить обновление сейчас?\n\n"
+            "Результаты, настройки и профили будут сохранены.",
+        ):
+            self.download_and_install_update(confirmed=True)
+
     def _version_code_from_text(self, value: Any) -> int:
         if value is None:
             return 0
@@ -8572,9 +8726,83 @@ class App(tk.Tk):
             self.last_update_info = {}
             self.update_status_var.set(f"Не удалось проверить обновление: {e}")
 
-    def copy_donate_card(self) -> None:
-        self.clipboard_clear()
-        self.clipboard_append("2202208897992260")
+    def open_support_page(self) -> None:
+        """Open the publicly listed CloudTips donation page in the default browser."""
+        self.open_url_safe(SUPPORT_URL, "Ссылка на поддержку проекта не задана.")
+
+    def _build_cloudtips_banner(self, parent: ttk.Frame) -> None:
+        """Large responsive clickable banner without external image dependencies."""
+        banner = tk.Canvas(
+            parent,
+            height=104,
+            background="#F7FAFF",
+            borderwidth=0,
+            highlightthickness=0,
+            takefocus=1,
+            cursor="hand2",
+        )
+        banner.pack(fill=tk.X, expand=True)
+        self.cloudtips_banner = banner
+        banner_hovered = False
+        banner_focused = False
+
+        def draw() -> None:
+            w = max(460, banner.winfo_width())
+            banner.delete("all")
+            bg = "#EBF3FF" if banner_hovered else "#F7FAFF"
+            border = "#467DC8" if banner_hovered or banner_focused else "#C5D5E8"
+            banner.create_rectangle(
+                2, 2, w - 2, 102, fill=bg, outline=border, width=2,
+            )
+
+            # CloudTips-style two-stroke mark, drawn as native Tk shapes.
+            banner.create_oval(22, 22, 80, 80, fill="#5D96DF", outline="")
+            banner.create_line(
+                38, 59, 61, 36, fill="#FFFFFF", width=8, capstyle=tk.ROUND,
+            )
+            banner.create_line(
+                42, 66, 66, 42, fill="#BEDDFF", width=7, capstyle=tk.ROUND,
+            )
+            banner.create_text(
+                98, 37, anchor="w", text="CloudTips",
+                fill="#142F56", font=("Segoe UI", 18, "bold"),
+            )
+            banner.create_text(
+                98, 68, anchor="w", text="Поддержать проект",
+                fill="#435A77", font=("Segoe UI", 11),
+            )
+
+            action_left = w - 218
+            banner.create_rectangle(
+                action_left, 24, w - 22, 80,
+                fill="#367CC8" if banner_hovered else "#417FD0",
+                outline="",
+            )
+            banner.create_text(
+                (action_left + w - 22) // 2, 52,
+                text="Поддержать  ↗", fill="#FFFFFF",
+                font=("Segoe UI", 12, "bold"),
+            )
+
+        def set_hover(value: bool) -> None:
+            nonlocal banner_hovered
+            banner_hovered = value
+            draw()
+
+        def set_focus(value: bool) -> None:
+            nonlocal banner_focused
+            banner_focused = value
+            draw()
+
+        banner.bind("<Configure>", lambda _event: draw())
+        banner.bind("<Enter>", lambda _event: set_hover(True))
+        banner.bind("<Leave>", lambda _event: set_hover(False))
+        banner.bind("<FocusIn>", lambda _event: set_focus(True))
+        banner.bind("<FocusOut>", lambda _event: set_focus(False))
+        banner.bind("<Button-1>", lambda _event: (banner.focus_set(), self.open_support_page()))
+        banner.bind("<Return>", lambda _event: self.open_support_page())
+        banner.bind("<space>", lambda _event: self.open_support_page())
+        draw()
 
     def copy_about_text(self) -> None:
         parts: list[str] = []
