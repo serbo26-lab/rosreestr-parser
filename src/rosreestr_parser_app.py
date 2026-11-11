@@ -2555,6 +2555,35 @@ def parse_fraction_share(value: Any):
         return None
 
 
+def burmistr_area_number(value: Any) -> float | None:
+    """Burmistr V2 requires the area to be stored as a number."""
+    if isinstance(value, bool):
+        return None
+    raw = str(value or "").strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return None
+    number = float(raw)
+    return number if 0 < number < 1000000000 else None
+
+
+def burmistr_effective_shares(items: list[tuple[int, Any, str, str, str]]):
+    """Joint owners with the same registered right contribute their share only once."""
+    effective: list[tuple[int, Any, str]] = []
+    joint_seen: dict[str, Any] = {}
+    conflicts: list[tuple[int, str]] = []
+    for row_idx, fraction, raw_share, joint, registration in items:
+        reg = str(registration or "").strip()
+        joint_key = (normalize_reg_key(reg) or reg) if reg not in {"", "."} else ""
+        if normalize_text(joint) == "да" and joint_key and fraction is not None:
+            if joint_key in joint_seen:
+                if fraction != joint_seen[joint_key]:
+                    conflicts.append((row_idx, reg))
+                continue
+            joint_seen[joint_key] = fraction
+        effective.append((row_idx, fraction, raw_share))
+    return effective, conflicts
+
+
 def should_skip_old_share_override(ws, header_row: int, cols: dict[str, int | None], target_row: int, flat: str, old_share: str, *, expanded: bool = False) -> bool:
     """
     Не переносим устаревшую долю 1/1 из старого реестра, если в новом Росреестре
