@@ -4733,8 +4733,8 @@ class ExcelOutput:
             return self.ws.cell(row_idx, col).value if col else ""
 
         validation_seen_reg_keys: set[tuple[str, str]] = set()
-        flat_groups: dict[str, list[tuple[int, Any, str]]] = {}
-        reg_to_people: dict[str, set[str]] = {}
+        flat_groups: dict[str, list[tuple[int, Any, str, str, str]]] = {}
+        reg_to_people: dict[tuple[str, str], dict[str, bool]] = {}
 
         for row_idx in range(2, self.ws.max_row + 1):
             cad = str(get(row_idx, "Кадастровый номер") or "").strip()
@@ -4754,18 +4754,17 @@ class ExcelOutput:
                 self.append_validation("Предупреждение", "Данные", row_idx, "Номер помещения", "Пустой номер помещения")
             if not area or area == ".":
                 self.append_validation("Предупреждение", "Данные", row_idx, "Площадь", "Пустая площадь")
+            elif self.export_format == "burmistr" and burmistr_area_number(area) is None:
+                self.append_validation("Ошибка", "Данные", row_idx, "Площадь", "В Burmistr V2 площадь должна быть числом")
             if reg == "." and reg_date:
                 self.append_validation("Ошибка", "Данные", row_idx, "Дата регистрации", "Если номер регистрации '.', дата должна быть пустой")
             if reg and reg != "." and not reg_date and "договор" not in normalize_text(reg):
                 self.append_validation("Предупреждение", "Данные", row_idx, "Дата регистрации", "Есть номер регистрации, но дата регистрации пустая")
-            if joint == "да" and share != "1/1":
-                self.append_validation("Ошибка", "Данные", row_idx, "Доля", "Для совместной собственности доля должна быть 1/1")
-
             frac = parse_fraction_share(share)
             if share and share != "." and frac is None:
                 self.append_validation("Ошибка", "Данные", row_idx, "Доля", f"Некорректный формат доли: {share}")
             if flat and flat != ".":
-                flat_groups.setdefault(flat.upper(), []).append((row_idx, frac, share))
+                flat_groups.setdefault(flat.upper(), []).append((row_idx, frac, share, joint, reg))
 
             if cad and cad != "." and reg:
                 # Одинаковый КН + номер регистрации может законно повторяться для нескольких собственников/долей.
@@ -4775,7 +4774,9 @@ class ExcelOutput:
             if reg and reg != ".":
                 person_key = normalize_text(" ".join([last, first, patr])).strip()
                 if person_key and person_key != ".":
-                    reg_to_people.setdefault(normalize_reg_key(reg) or reg, set()).add(person_key)
+                    reg_key = normalize_reg_key(reg) or reg
+                    group = reg_to_people.setdefault((cad, reg_key), {})
+                    group[person_key] = group.get(person_key, True) and normalize_text(joint) == "да"
 
         try:
             from fractions import Fraction
@@ -4793,8 +4794,8 @@ class ExcelOutput:
         except Exception as e:
             self.append_validation("Предупреждение", "Данные", "", "Доля", f"Не удалось проверить суммы долей: {e}")
 
-        for reg_key, people in reg_to_people.items():
-            if len(people) > 1:
+        for (_cad, reg_key), people in reg_to_people.items():
+            if len(people) > 1 and not all(people.values()):
                 self.append_validation("Предупреждение", "Данные", "", "Номер регистрации", f"Один номер права встречается у разных ФИО: {reg_key}; {', '.join(sorted(people)[:5])}")
 
         # Земля/здания не должны попадать в основной лист. Проверяем хотя бы дубли между основным листом и листом "Здания и участки".
@@ -4831,7 +4832,11 @@ class ExcelOutput:
                 continue
             val = values.get(header, "")
             cell = self.ws.cell(row_idx, col_idx)
-            cell.value = val
+            if self.export_format == "burmistr" and header == "Площадь помещения, м2 (обяз.)":
+                numeric = burmistr_area_number(val)
+                cell.value = numeric if numeric is not None else val
+            else:
+                cell.value = val
             if self.row_style and col_idx - 1 < len(self.row_style):
                 cell._style = copy(self.row_style[col_idx - 1])
             # Номера регистрации, кадастровые номера и даты прав держим как текст.
