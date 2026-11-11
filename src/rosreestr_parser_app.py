@@ -2555,6 +2555,17 @@ def parse_fraction_share(value: Any):
         return None
 
 
+def burmistr_area_number(value: Any) -> float | None:
+    """Burmistr V2 requires the area to be stored as a number."""
+    if isinstance(value, bool):
+        return None
+    raw = str(value or "").strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return None
+    number = float(raw)
+    return number if 0 < number < 1000000000 else None
+
+
 def should_skip_old_share_override(ws, header_row: int, cols: dict[str, int | None], target_row: int, flat: str, old_share: str, *, expanded: bool = False) -> bool:
     """
     Не переносим устаревшую долю 1/1 из старого реестра, если в новом Росреестре
@@ -4725,6 +4736,8 @@ class ExcelOutput:
                 self.append_validation("Предупреждение", "Данные", row_idx, "Номер помещения", "Пустой номер помещения")
             if not area or area == ".":
                 self.append_validation("Предупреждение", "Данные", row_idx, "Площадь", "Пустая площадь")
+            elif self.export_format == "burmistr" and burmistr_area_number(area) is None:
+                self.append_validation("Ошибка", "Данные", row_idx, "Площадь", "В Burmistr V2 площадь должна быть числом")
             if reg == "." and reg_date:
                 self.append_validation("Ошибка", "Данные", row_idx, "Дата регистрации", "Если номер регистрации '.', дата должна быть пустой")
             if reg and reg != "." and not reg_date and "договор" not in normalize_text(reg):
@@ -4802,7 +4815,11 @@ class ExcelOutput:
                 continue
             val = values.get(header, "")
             cell = self.ws.cell(row_idx, col_idx)
-            cell.value = val
+            if self.export_format == "burmistr" and header == "Площадь помещения, м2 (обяз.)":
+                numeric = burmistr_area_number(val)
+                cell.value = numeric if numeric is not None else val
+            else:
+                cell.value = val
             if self.row_style and col_idx - 1 < len(self.row_style):
                 cell._style = copy(self.row_style[col_idx - 1])
             # Номера регистрации, кадастровые номера и даты прав держим как текст.
