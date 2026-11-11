@@ -4781,15 +4781,21 @@ class ExcelOutput:
         try:
             from fractions import Fraction
             for flat, items in flat_groups.items():
-                if not items or any(frac is None for _r, frac, raw in items if raw and raw != "."):
+                if not items or any(frac is None for _r, frac, raw, _j, _reg in items if raw and raw != "."):
                     continue
-                fractions = [frac for _r, frac, _raw in items if frac is not None]
-                if not fractions:
+                effective, conflicts = burmistr_effective_shares(items)
+                for row_idx, reg in conflicts:
+                    self.append_validation(
+                        "Ошибка", "Данные", row_idx, "Доля",
+                        f"У участников совместной собственности с номером права {reg} указаны разные доли",
+                    )
+                fractions = [frac for _r, frac, _raw in effective if frac is not None]
+                if not fractions or conflicts:
                     continue
                 total = sum(fractions, Fraction(0, 1))
                 if total != Fraction(1, 1):
-                    rows = ", ".join(str(r) for r, _f, _raw in items)
-                    shares = ", ".join(str(raw) for _r, _f, raw in items)
+                    rows = ", ".join(str(r) for r, _f, _raw, _j, _reg in items)
+                    shares = ", ".join(str(raw) for _r, _f, raw, _j, _reg in items)
                     self.append_validation("Ошибка", "Данные", rows, "Доля", f"Сумма долей по помещению {flat} = {total}, не равна 1/1. Доли: {shares}")
         except Exception as e:
             self.append_validation("Предупреждение", "Данные", "", "Доля", f"Не удалось проверить суммы долей: {e}")
