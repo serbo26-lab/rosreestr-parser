@@ -2566,24 +2566,6 @@ def burmistr_area_number(value: Any) -> float | None:
     return number if 0 < number < 1000000000 else None
 
 
-def burmistr_effective_shares(items: list[tuple[int, Any, str, str, str]]):
-    """Joint owners with the same registered right contribute their share only once."""
-    effective: list[tuple[int, Any, str]] = []
-    joint_seen: dict[str, Any] = {}
-    conflicts: list[tuple[int, str]] = []
-    for row_idx, fraction, raw_share, joint, registration in items:
-        reg = str(registration or "").strip()
-        joint_key = (normalize_reg_key(reg) or reg) if reg not in {"", "."} else ""
-        if normalize_text(joint) == "да" and joint_key and fraction is not None:
-            if joint_key in joint_seen:
-                if fraction != joint_seen[joint_key]:
-                    conflicts.append((row_idx, reg))
-                continue
-            joint_seen[joint_key] = fraction
-        effective.append((row_idx, fraction, raw_share))
-    return effective, conflicts
-
-
 def should_skip_old_share_override(ws, header_row: int, cols: dict[str, int | None], target_row: int, flat: str, old_share: str, *, expanded: bool = False) -> bool:
     """
     Не переносим устаревшую долю 1/1 из старого реестра, если в новом Росреестре
@@ -4733,8 +4715,8 @@ class ExcelOutput:
             return self.ws.cell(row_idx, col).value if col else ""
 
         validation_seen_reg_keys: set[tuple[str, str]] = set()
-        flat_groups: dict[str, list[tuple[int, Any, str, str, str]]] = {}
-        reg_to_people: dict[tuple[str, str], dict[str, bool]] = {}
+        flat_groups: dict[str, list[tuple[int, Any, str]]] = {}
+        reg_to_people: dict[str, set[str]] = {}
 
         for row_idx in range(2, self.ws.max_row + 1):
             cad = str(get(row_idx, "Кадастровый номер") or "").strip()
@@ -4760,11 +4742,14 @@ class ExcelOutput:
                 self.append_validation("Ошибка", "Данные", row_idx, "Дата регистрации", "Если номер регистрации '.', дата должна быть пустой")
             if reg and reg != "." and not reg_date and "договор" not in normalize_text(reg):
                 self.append_validation("Предупреждение", "Данные", row_idx, "Дата регистрации", "Есть номер регистрации, но дата регистрации пустая")
+            if joint == "да" and share != "1/1":
+                self.append_validation("Ошибка", "Данные", row_idx, "Доля", "Для совместной собственности доля должна быть 1/1")
+
             frac = parse_fraction_share(share)
             if share and share != "." and frac is None:
                 self.append_validation("Ошибка", "Данные", row_idx, "Доля", f"Некорректный формат доли: {share}")
             if flat and flat != ".":
-                flat_groups.setdefault(flat.upper(), []).append((row_idx, frac, share, joint, reg))
+                flat_groups.setdefault(flat.upper(), []).append((row_idx, frac, share))
 
             if cad and cad != "." and reg:
                 # Одинаковый КН + номер регистрации может законно повторяться для нескольких собственников/долей.
@@ -4774,34 +4759,26 @@ class ExcelOutput:
             if reg and reg != ".":
                 person_key = normalize_text(" ".join([last, first, patr])).strip()
                 if person_key and person_key != ".":
-                    reg_key = normalize_reg_key(reg) or reg
-                    group = reg_to_people.setdefault((cad, reg_key), {})
-                    group[person_key] = group.get(person_key, True) and normalize_text(joint) == "да"
+                    reg_to_people.setdefault(normalize_reg_key(reg) or reg, set()).add(person_key)
 
         try:
             from fractions import Fraction
             for flat, items in flat_groups.items():
-                if not items or any(frac is None for _r, frac, raw, _j, _reg in items if raw and raw != "."):
+                if not items or any(frac is None for _r, frac, raw in items if raw and raw != "."):
                     continue
-                effective, conflicts = burmistr_effective_shares(items)
-                for row_idx, reg in conflicts:
-                    self.append_validation(
-                        "Ошибка", "Данные", row_idx, "Доля",
-                        f"У участников совместной собственности с номером права {reg} указаны разные доли",
-                    )
-                fractions = [frac for _r, frac, _raw in effective if frac is not None]
-                if not fractions or conflicts:
+                fractions = [frac for _r, frac, _raw in items if frac is not None]
+                if not fractions:
                     continue
                 total = sum(fractions, Fraction(0, 1))
                 if total != Fraction(1, 1):
-                    rows = ", ".join(str(r) for r, _f, _raw, _j, _reg in items)
-                    shares = ", ".join(str(raw) for _r, _f, raw, _j, _reg in items)
+                    rows = ", ".join(str(r) for r, _f, _raw in items)
+                    shares = ", ".join(str(raw) for _r, _f, raw in items)
                     self.append_validation("Ошибка", "Данные", rows, "Доля", f"Сумма долей по помещению {flat} = {total}, не равна 1/1. Доли: {shares}")
         except Exception as e:
             self.append_validation("Предупреждение", "Данные", "", "Доля", f"Не удалось проверить суммы долей: {e}")
 
-        for (_cad, reg_key), people in reg_to_people.items():
-            if len(people) > 1 and not all(people.values()):
+        for reg_key, people in reg_to_people.items():
+            if len(people) > 1:
                 self.append_validation("Предупреждение", "Данные", "", "Номер регистрации", f"Один номер права встречается у разных ФИО: {reg_key}; {', '.join(sorted(people)[:5])}")
 
         # Земля/здания не должны попадать в основной лист. Проверяем хотя бы дубли между основным листом и листом "Здания и участки".
