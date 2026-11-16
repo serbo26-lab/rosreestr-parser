@@ -92,10 +92,16 @@ class TestSafeShareTransfer(unittest.TestCase):
         ))
 
     def test_five_new_rights_four_old_quarters_are_rejected_together(self):
-        self.check_rejected(["1/5"] * 5, ["1/4"] * 4, "23/20")
+        self.check_rejected(["1/5"] * 5, ["1/4"] * 4, "6/5")
+
+    def test_three_quarters_with_two_fifths_are_rejected(self):
+        self.check_rejected(["1/5"] * 5, ["1/4"] * 3, "23/20")
 
     def test_three_new_rights_two_old_halves_are_rejected_together(self):
-        self.check_rejected(["1/3"] * 3, ["1/2"] * 2, "7/6")
+        self.check_rejected(["1/3"] * 3, ["1/2"] * 2, "4/3")
+
+    def test_one_half_with_two_thirds_is_rejected(self):
+        self.check_rejected(["1/3"] * 3, ["1/2"], "7/6")
 
     def test_consistent_unequal_old_fractions_are_transferred(self):
         _, ws = new_workbook(["1/2", "1/2"])
