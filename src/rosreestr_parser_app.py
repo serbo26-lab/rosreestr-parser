@@ -2293,8 +2293,9 @@ def confirmed_card_section(text: str, expected_cad: str) -> str:
         identity = lines[start + 1:min(end, start + 32)]
         cad = find_line_value(identity, "Кадастровый номер")
         status = find_line_value(identity, "Статус объекта")
-        if cad == expected and status and status != ".":
-            return "\n".join(lines[start:])
+        if cad and status and status != ".":
+            # Do not fall back to an older card when a different card is visible.
+            return "\n".join(lines[start:]) if cad == expected else ""
     return ""
 
 
@@ -2302,8 +2303,8 @@ def has_registered_ownership(info: ObjectInfo) -> bool:
     """A real ownership registration, not a blank placeholder."""
     return any(
         "собствен" in normalize_text(right.right_type)
-        and bool(clean_reg_number(right.reg_number))
-        and str(right.reg_number or "").strip() != "."
+        and bool(re.search(r"\d", str(right.reg_number or "")))
+        and str(right.reg_number or "").strip() not in {"", ".", "-"}
         for right in info.rights
     )
 
@@ -6675,7 +6676,7 @@ class ParserWorker(threading.Thread):
                         if "актуаль" not in normalize_text(info.status) and info.status:
                             self.log(f"  Неожиданный статус объекта: {info.status}")
 
-                        if self.is_full_info_mode():
+                        if self.is_full_info_mode() and not compare_multiple:
                             rows_added = self.excel.append_full_object_info(info, search_address=search_address)
                             self.metrics["Полных карточек"] = self.metrics.get("Полных карточек", 0) + 1
                             self.log(f"  Полный парсинг: записано строк в широкий лист {rows_added}; КН {info.cadastral_number}")
