@@ -6643,7 +6643,20 @@ class ParserWorker(threading.Thread):
                         return
 
                     got_any_exact_candidate = True
+                    # Multiple rows can describe the same KN. Inspect each different
+                    # cadastral object only once, regardless of search-result order.
+                    unique_candidates: list[dict[str, Any]] = []
+                    seen_candidate_cads: set[str] = set()
                     for candidate in candidates:
+                        candidate_cad = str(candidate.get("cad") or "").strip()
+                        if not candidate_cad or candidate_cad in seen_candidate_cads:
+                            continue
+                        seen_candidate_cads.add(candidate_cad)
+                        unique_candidates.append(candidate)
+
+                    compare_multiple = len(unique_candidates) > 1
+                    verified_rooms: list[ObjectInfo] = []
+                    for candidate in unique_candidates:
                         if not self.wait_control():
                             return
                         cand_cad = candidate.get("cad") or ""
@@ -6677,8 +6690,62 @@ class ParserWorker(threading.Thread):
                             self.back_to_results()
                             continue
 
+                        if compare_multiple:
+                            verified_rooms.append(info)
+                            self.log(
+                                f"  Кандидат {info.cadastral_number}: статус {info.status or 'не указан'}, "
+                                f"зарегистрированное право собственности: "
+                                f"{'есть' if has_registered_ownership(info) else 'нет'}."
+                            )
+                            self.back_to_results()
+                            continue
+
                         self.write_object_rows(info)
                         self.metrics["Найдено помещений/квартир"] = self.metrics.get("Найдено помещений/квартир", 0) + 1
+                        got_actual = True
+                        return
+
+                    if compare_multiple and verified_rooms:
+                        chosen, reason = choose_oss_current_card(verified_rooms)
+                        all_cads = ", ".join(str(c.get("cad") or "") for c in unique_candidates)
+                        if chosen is None:
+                            self.log(
+                                f"  Помещение {flat_no}: автоматический выбор КН невозможен. "
+                                f"{reason}. Кандидаты: {all_cads}."
+                            )
+                            self.excel.append_disputed(
+                                search_address, flat_no, all_cads,
+                                "Несколько кадастровых номеров с одинаковым адресом",
+                                "Требуется ручная проверка",
+                                reason,
+                            )
+                            self.excel.append_error(
+                                flat_no, search_address, "Спорно",
+                                f"{reason}. Проверить: {all_cads}",
+                            )
+                            self.metrics["Спорных результатов"] = (
+                                self.metrics.get("Спорных результатов", 0) + 1
+                            )
+                            return
+
+                        self.log(
+                            f"  Выбран КН {chosen.cadastral_number} для помещения {flat_no}: "
+                            f"{reason}. Проверены: {all_cads}."
+                        )
+                        if self.is_full_info_mode():
+                            rows_added = self.excel.append_full_object_info(
+                                chosen, search_address=search_address
+                            )
+                            self.metrics["Полных карточек"] = self.metrics.get("Полных карточек", 0) + 1
+                            self.log(
+                                f"  Полный парсинг: записано строк {rows_added}; "
+                                f"КН {chosen.cadastral_number}"
+                            )
+                        else:
+                            self.write_object_rows(chosen)
+                            self.metrics["Найдено помещений/квартир"] = (
+                                self.metrics.get("Найдено помещений/квартир", 0) + 1
+                            )
                         got_actual = True
                         return
 
