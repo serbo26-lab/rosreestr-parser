@@ -226,7 +226,7 @@ DEFAULT_CONFIG = {
     "service_url": "https://lk.rosreestr.ru/eservices/real-estate-objects-online",
     "address_prefix": "г Город ул Улица д 1 кв",
     "search_numbered_units": True,
-    "try_address_variants": True,
+    "try_address_variants": False,
     "strict_street_match": False,
     "strict_house_match": True,
     "include_unnumbered_house_objects": False,
@@ -389,6 +389,16 @@ def resource_path(name: str) -> Path:
     return app_dir() / name
 
 
+def migrate_legacy_address_variants(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Switch the old always-on default off once, then preserve user choices."""
+    cfg = dict(cfg or {})
+    marker = "address_variants_default_off_applied"
+    if not cfg.get(marker):
+        cfg["try_address_variants"] = False
+        cfg[marker] = True
+    return cfg
+
+
 def load_config(config_path: Path) -> dict[str, Any]:
     cfg = DEFAULT_CONFIG.copy()
     if config_path.exists():
@@ -399,7 +409,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
                 cfg.update(loaded)
         except Exception:
             pass
-    return cfg
+    return migrate_legacy_address_variants(cfg)
 
 
 def save_config(config_path: Path, cfg: dict[str, Any]) -> None:
@@ -5274,7 +5284,7 @@ class ParserWorker(threading.Thread):
             return
 
         search_numbered = bool(self.cfg.get("search_numbered_units", True))
-        try_variants = bool(self.cfg.get("try_address_variants", True))
+        try_variants = bool(self.cfg.get("try_address_variants", False))
 
         manual_numbers = str(self.cfg.get("manual_unit_numbers") or "")
         manual_file_path = str(self.cfg.get("manual_unit_file_path") or "")
@@ -8284,7 +8294,7 @@ class App(tk.Tk):
         self.search_numbered_var = tk.BooleanVar(value=bool(self.cfg.get("search_numbered_units", True)))
         self.search_numbered_check = ttk.Checkbutton(advanced_grid, text="Искать квартиры/помещения по диапазону номеров", variable=self.search_numbered_var)
         self.search_numbered_check.grid(row=0, column=0, sticky="w", pady=2)
-        self.try_variants_var = tk.BooleanVar(value=bool(self.cfg.get("try_address_variants", True)))
+        self.try_variants_var = tk.BooleanVar(value=bool(self.cfg.get("try_address_variants", False)))
         self.try_variants_check = ttk.Checkbutton(advanced_grid, text="Пробовать варианты номера: кв / квартира / пом. / помещение / №", variable=self.try_variants_var)
         self.try_variants_check.grid(row=1, column=0, sticky="w", pady=2)
         self.strict_street_var = tk.BooleanVar(value=bool(self.cfg.get("strict_street_match", False)))
@@ -10255,7 +10265,9 @@ class App(tk.Tk):
                 cfg = json.load(f)
             if not isinstance(cfg, dict):
                 raise ValueError("Профиль не является JSON-объектом")
-            self.cfg.update(cfg)
+            # Legacy profiles stored the former on-by-default value.
+            # A profile saved after the migration retains the user's explicit choice.
+            self.cfg.update(migrate_legacy_address_variants(cfg))
             for key, var in self.vars.items():
                 if key in self.cfg:
                     var.set(str(self.cfg.get(key, "")))
@@ -10266,7 +10278,7 @@ class App(tk.Tk):
                 if key in self.cfg:
                     var.set(str(self.cfg.get(key, "")))
             self.search_numbered_var.set(bool(self.cfg.get("search_numbered_units", True)))
-            self.try_variants_var.set(bool(self.cfg.get("try_address_variants", True)))
+            self.try_variants_var.set(bool(self.cfg.get("try_address_variants", False)))
             self.strict_street_var.set(bool(self.cfg.get("strict_street_match", False)))
             self.strict_house_var.set(bool(self.cfg.get("strict_house_match", True)))
             self.include_unnumbered_var.set(bool(self.cfg.get("include_unnumbered_house_objects", False)))
@@ -10325,7 +10337,7 @@ class App(tk.Tk):
         address_prefix = str(cfg.get("address_prefix") or "")
         start_flat = int(cfg.get("start_flat") or 1)
         end_flat = int(cfg.get("end_flat") or start_flat)
-        try_variants = bool(cfg.get("try_address_variants", True))
+        try_variants = bool(cfg.get("try_address_variants", False))
 
         lines.append("ПРЕДПРОСМОТР ПОИСКОВЫХ ЗАПРОСОВ")
         lines.append("")
@@ -10467,7 +10479,8 @@ class App(tk.Tk):
     def collect_cfg(self) -> dict[str, Any]:
         cfg = self.cfg.copy()
         cfg["search_numbered_units"] = bool(getattr(self, "search_numbered_var", tk.BooleanVar(value=True)).get())
-        cfg["try_address_variants"] = bool(getattr(self, "try_variants_var", tk.BooleanVar(value=True)).get())
+        cfg["try_address_variants"] = bool(getattr(self, "try_variants_var", tk.BooleanVar(value=False)).get())
+        cfg["address_variants_default_off_applied"] = True
         cfg["strict_street_match"] = bool(getattr(self, "strict_street_var", tk.BooleanVar(value=False)).get())
         cfg["strict_house_match"] = bool(getattr(self, "strict_house_var", tk.BooleanVar(value=True)).get())
         cfg["include_unnumbered_house_objects"] = bool(getattr(self, "include_unnumbered_var", tk.BooleanVar(value=False)).get())
