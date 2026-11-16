@@ -17,7 +17,7 @@
   "close_browser_after_finish": false,
   "rate_limit_pause_seconds": 10,
   "rate_limit_retry_count": 12,
-  "try_address_variants": true,
+  "try_address_variants": false,
   "include_unnumbered_house_objects": false,
   "unnumbered_max_pages": 10,
   "auto_output_filename": true,
