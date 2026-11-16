@@ -2793,6 +2793,139 @@ def append_share_sum_warnings(ws, header_row: int, cols: dict[str, int | None], 
     return warning_count
 
 
+
+def commit_old_share_transfers(
+    ws,
+    header_row: int,
+    cols: dict[str, int | None],
+    pending: list[tuple[Any, str, str, int]],
+    match_log: list[list[Any]],
+) -> list[tuple[str, str]]:
+    """
+    Применяем старые доли одной транзакцией на помещение. Если предложенные
+    доли вместе не дают 1/1, не меняем НИ ОДНУ долю этого помещения.
+    ФИО и номера прав, уже сопоставленные по прежним правилам, сохраняются.
+
+    Храним ссылки на Excel-ячейки, а не номера строк: при разворачивании
+    старых договоров openpyxl перемещает существующие ячейки.
+    """
+    from fractions import Fraction
+
+    flat_col, share_col = cols.get("flat"), cols.get("share")
+    if not flat_col or not share_col or not pending:
+        return []
+
+    groups: dict[str, list[int]] = {}
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        flat = clean_unit_number(ws.cell(row_idx, flat_col).value).upper()
+        if flat:
+            groups.setdefault(flat, []).append(row_idx)
+
+    pending_groups: dict[str, list[tuple[Any, str, int]]] = {}
+    for cell, old_share, flat, log_idx in pending:
+        pending_groups.setdefault(flat.upper(), []).append((cell, old_share, log_idx))
+
+    conflicts: list[tuple[str, str]] = []
+    for flat, proposals in pending_groups.items():
+        rows = groups.get(flat, [])
+        valid_refs = all(
+            ws.cell(cell.row, cell.column) is cell
+            and cell.row in rows
+            and cell.column == share_col
+            for cell, _share, _log_idx in proposals
+        )
+        projected = {
+            cell.row: str(share).strip()
+            for cell, share, _log_idx in proposals
+            if valid_refs
+        }
+        joint_col = cols.get("joint")
+        joint = bool(joint_col) and any(
+            normalize_text(ws.cell(r, joint_col).value) == "да" for r in rows
+        )
+        proposed_fracs = [
+            parse_fraction_share(projected.get(r, ws.cell(r, share_col).value))
+            for r in rows
+        ]
+        projected_total = (
+            sum(proposed_fracs, Fraction(0, 1))
+            if all(f is not None for f in proposed_fracs) else None
+        )
+
+        # В старой приватизации может остаться пустая строка с ".".
+        # Существующая очистка удалит её, если остальные строки покрывают 1/1.
+        removable_placeholder = False
+        reg_col = cols.get("reg")
+        if valid_refs and not joint and reg_col and rows:
+            real_fracs = []
+            placeholder_count = 0
+            for row_idx, frac in zip(rows, proposed_fracs):
+                reg = str(ws.cell(row_idx, reg_col).value or "").strip()
+                placeholder = (not reg or reg == ".") and is_empty_person_cells(ws, row_idx, cols)
+                if placeholder:
+                    placeholder_count += 1
+                else:
+                    real_fracs.append(frac)
+            removable_placeholder = (
+                placeholder_count > 0
+                and bool(real_fracs)
+                and all(f is not None for f in real_fracs)
+                and sum(real_fracs, Fraction(0, 1)) == Fraction(1, 1)
+            )
+
+        if valid_refs and (joint or projected_total == Fraction(1, 1) or removable_placeholder):
+            for cell, share, log_idx in proposals:
+                cell.value = share
+                if 0 <= log_idx < len(match_log) and match_log[log_idx][3] == "доля предложена":
+                    match_log[log_idx][3] = "доля перенесена"
+            continue
+
+        if projected_total is None:
+            detail = "не все доли после переноса можно проверить"
+        else:
+            detail = f"сумма долей после переноса = {projected_total} вместо 1/1"
+        if not valid_refs:
+            detail = "после разворачивания строк не удалось однозначно связать переносимые доли"
+        reason = (
+            f"Доли старого и нового реестров расходятся: {detail}. "
+            "Старые доли не применены, сохранены доли Росреестра. Требуется ручная проверка."
+        )
+        conflicts.append((flat, reason))
+        for _cell, _share, log_idx in proposals:
+            if 0 <= log_idx < len(match_log):
+                log_row = match_log[log_idx]
+                if log_row[3] == "доля предложена":
+                    log_row[3] = "доля не перенесена"
+                log_row[7] = (str(log_row[7] or "") + "; " + reason).strip("; ")
+    return conflicts
+
+
+def mark_old_share_conflicts(
+    ws,
+    header_row: int,
+    cols: dict[str, int | None],
+    conflicts: list[tuple[str, str]],
+    ambiguous: list[list[Any]],
+    match_log: list[list[Any]],
+) -> None:
+    """После удаления лишних строк отмечаем итоговые строки Excel."""
+    flat_col = cols.get("flat")
+    if not flat_col:
+        return
+    for flat, reason in conflicts:
+        rows = [
+            r for r in range(header_row + 1, ws.max_row + 1)
+            if clean_unit_number(ws.cell(r, flat_col).value).upper() == flat
+        ]
+        row_text = ", ".join(str(r) for r in rows)
+        ambiguous.append([row_text, flat, "", "", reason, ""])
+        highlight_reconcile_rows(ws, rows, share_col=cols.get("share"), reason=reason)
+        match_log.append([
+            row_text, flat, "", "доли не перенесены",
+            "проверка суммы долей по помещению", "", "", reason,
+        ])
+
+
 def header_score(value: Any, keywords: list[str]) -> int:
     n = normalize_text(value)
     return sum(1 for kw in keywords if kw in n)
@@ -3533,6 +3666,7 @@ def apply_stable_share_to_ambiguous_row(
     transfer_shares: bool,
     match_log: list[list[Any]],
     note: str,
+    pending_share_overrides: list[tuple[Any, str, str, int]] | None = None,
 ) -> str:
     # При неоднозначном ФИО переносит только устойчивую долю из старого реестра.
     if not transfer_shares or not cols.get("share") or not records:
@@ -3549,10 +3683,16 @@ def apply_stable_share_to_ambiguous_row(
         return msg
 
     old_value = ws.cell(row_idx, cols.get("share")).value if cols.get("share") else ""
-    set_cell(ws, row_idx, cols.get("share"), stable_share)
     sources = "; ".join(f"{r.source_file}/{r.sheet}/строка {r.row}" for r in records[:5])
-    msg = f"ФИО неоднозначны, но доля перенесена по совпавшему номеру права: {old_value} -> {stable_share}"
-    match_log.append([row_idx, flat, reg_raw, "доля перенесена", "неоднозначное ФИО, устойчивая доля", "", stable_share, f"{note}; {sources}"])
+    if pending_share_overrides is None:
+        set_cell(ws, row_idx, cols.get("share"), stable_share)
+        status = "доля перенесена"
+        msg = f"ФИО неоднозначны, но доля перенесена по совпавшему номеру права: {old_value} -> {stable_share}"
+    else:
+        pending_share_overrides.append((ws.cell(row_idx, cols["share"]), stable_share, flat, len(match_log)))
+        status = "доля предложена"
+        msg = f"ФИО неоднозначны, доля {stable_share} проверяется перед переносом"
+    match_log.append([row_idx, flat, reg_raw, status, "неоднозначное ФИО, устойчивая доля", "", stable_share, f"{note}; {sources}"])
     return msg
 
 
@@ -3632,6 +3772,7 @@ def reconcile_registries(
 
     match_log: list[list[Any]] = []
     ambiguous: list[list[Any]] = []
+    pending_share_overrides: list[tuple[Any, str, str, int]] = []
     stats = {"matched_by_reg": 0, "matched_by_contract": 0, "matched_by_address_surname": 0, "expanded_rows": 0, "ambiguous": 0, "not_found": 0, "skipped_existing": 0}
 
     def try_address_surname_match(row_idx: int, flat: str, reg_raw: str) -> bool:
@@ -3756,6 +3897,7 @@ def reconcile_registries(
                                     transfer_shares,
                                     match_log,
                                     reason,
+                                    pending_share_overrides=pending_share_overrides,
                                 )
                                 if share_msg:
                                     reason += f"; {share_msg}"
@@ -3792,6 +3934,7 @@ def reconcile_registries(
                         transfer_shares,
                         match_log,
                         reason,
+                        pending_share_overrides=pending_share_overrides,
                     )
                     if share_msg:
                         reason += f"; {share_msg}"
@@ -3870,22 +4013,30 @@ def reconcile_registries(
             elif cols.get("right_type") and "совместная собственность" in match_type:
                 set_cell(ws, target_row, cols.get("right_type"), "Общая совместная собственность")
             share_note = ""
+            share_staged = False
             if transfer_shares and rec.share and cols.get("share") and "совместная собственность" not in match_type:
                 if should_skip_old_share_override(ws, header_row, cols, target_row, flat, rec.share, expanded=bool(should_expand and len(chosen) > 1)):
                     share_note = f"; доля из старого реестра {rec.share} не перенесена, сохранена доля Росреестра {ws.cell(target_row, cols.get('share')).value}"
                 else:
-                    set_cell(ws, target_row, cols.get("share"), rec.share)
+                    share_staged = True
 
             if rec.is_contract:
                 stats["matched_by_contract"] += 1
             else:
                 stats["matched_by_reg"] += 1
+            log_idx = len(match_log)
             match_log.append([
                 target_row, flat, reg_raw, "найдено", match_type,
                 rec.fio_original, rec.share, f"{rec.source_file} / {rec.sheet} / строка {rec.row}{share_note}",
             ])
+            if share_staged:
+                pending_share_overrides.append((ws.cell(target_row, cols["share"]), rec.share, flat, log_idx))
 
+    share_conflicts = commit_old_share_transfers(
+        ws, header_row, cols, pending_share_overrides, match_log
+    )
     removed_placeholders = remove_redundant_placeholder_rows(ws, header_row, cols, ambiguous, match_log)
+    mark_old_share_conflicts(ws, header_row, cols, share_conflicts, ambiguous, match_log)
     stats["removed_placeholders"] = removed_placeholders
 
     share_warning_count = append_share_sum_warnings(ws, header_row, cols, ambiguous)
