@@ -2267,6 +2267,63 @@ def parse_card_text(text: str, fallback_flat: str, fallback_cadastral: str = "")
     )
 
 
+def confirmed_card_section(text: str, expected_cad: str) -> str:
+    """Return a card's details only when its own field confirms the requested KN.
+
+    A KN in the search results, sidebar or an older open card is not evidence.
+    """
+    expected = clean_cadastral_number(expected_cad)
+    if not expected:
+        return ""
+    lines = split_lines(text)
+    headings = [
+        i for i, line in enumerate(lines)
+        if normalize_text(line) in {"общая информация", "сведения об объекте"}
+    ]
+    for start in reversed(headings):
+        end = next(
+            (i for i in range(start + 1, len(lines))
+             if normalize_text(lines[i]) in {
+                 "характеристики объекта", "общая информация", "сведения об объекте",
+                 "сведения о правах и ограничениях (обременениях)",
+             }),
+            len(lines),
+        )
+        # The identity fields live in the compact "Общая информация" section.
+        identity = lines[start + 1:min(end, start + 32)]
+        cad = find_line_value(identity, "Кадастровый номер")
+        status = find_line_value(identity, "Статус объекта")
+        if cad == expected and status and status != ".":
+            return "\n".join(lines[start:])
+    return ""
+
+
+def has_registered_ownership(info: ObjectInfo) -> bool:
+    """A real ownership registration, not a blank placeholder."""
+    return any(
+        "собствен" in normalize_text(right.right_type)
+        and bool(clean_reg_number(right.reg_number))
+        and str(right.reg_number or "").strip() != "."
+        for right in info.rights
+    )
+
+
+def choose_oss_current_card(cards: list[ObjectInfo]) -> tuple[ObjectInfo | None, str]:
+    """Pick a unique current card; never guess between equal current rights."""
+    current = [
+        card for card in cards
+        if normalize_text(card.status).startswith("актуаль")
+    ]
+    if len(current) == 1:
+        return current[0], "единственный подтверждённый актуальный объект"
+    if len(current) > 1:
+        with_rights = [card for card in current if has_registered_ownership(card)]
+        if len(with_rights) == 1:
+            return with_rights[0], "из актуальных объектов только у этого есть зарегистрированное право собственности"
+        return None, "несколько актуальных объектов; по сведениям о собственности нельзя выбрать один"
+    return None, "ни одна проверенная карточка не имеет подтверждённого статуса «Актуально»"
+
+
 def municipal_value(ownership_form: str) -> str:
     form = normalize_text(ownership_form)
     if "муницип" in form or "государ" in form:
@@ -6918,17 +6975,13 @@ class ParserWorker(threading.Thread):
             self.log(f"  Очередь открытия результатов: {preview}")
         return candidates
 
-    def card_details_visible(self) -> bool:
+    def card_details_visible(self, cad: str = "") -> bool:
         assert self.page is not None
         try:
-            text = normalize_text(self.page.inner_text("body", timeout=2500))
+            text = self.page.inner_text("body", timeout=2500)
         except Exception:
             return False
-        return (
-            "сведения об объекте" in text
-            or "общая информация" in text
-            or "статус объекта" in text
-        )
+        return bool(confirmed_card_section(text, cad))
 
     def wait_candidate_card_opened(self, cad: str, timeout_ms: int = 7000) -> bool:
         assert self.page is not None
@@ -6945,15 +6998,15 @@ class ParserWorker(threading.Thread):
                 if self.context is not None:
                     for p in list(self.context.pages):
                         try:
-                            txt = normalize_text(p.inner_text("body", timeout=1000))
+                            txt = p.inner_text("body", timeout=1000)
                         except Exception:
                             continue
-                        if "сведения об объекте" in txt or "общая информация" in txt or "статус объекта" in txt:
+                        if confirmed_card_section(txt, cad):
                             self.page = p
                             return True
             except Exception:
                 pass
-            if self.card_details_visible():
+            if self.card_details_visible(cad):
                 return True
             try:
                 self.page.wait_for_timeout(300)
@@ -7007,7 +7060,7 @@ class ParserWorker(threading.Thread):
                         body_after = self.page.inner_text("body", timeout=3000) or ""
                     except Exception:
                         body_after = ""
-                    if cad not in body_after and not self.card_details_visible():
+                    if cad not in body_after and not self.card_details_visible(cad):
                         try:
                             self.back_to_results()
                         except Exception:
@@ -7037,9 +7090,15 @@ class ParserWorker(threading.Thread):
                         return None
 
                 text = self.page.inner_text("body", timeout=10000)
-                info = parse_card_text(text, flat_no, cad)
-                if not re.fullmatch(r"\d{2}:\d{2}:\d{3,}:\d+", info.cadastral_number or ""):
-                    info.cadastral_number = cad or "."
+                card_section = confirmed_card_section(text, cad)
+                if not card_section:
+                    raise RuntimeError(f"Открытая карточка не подтвердила КН {cad}")
+                info = parse_card_text(card_section, flat_no)
+                if info.cadastral_number != cad:
+                    raise RuntimeError(
+                        f"Ожидался КН {cad}, в карточке указан {info.cadastral_number}"
+                    )
+                self.log(f"  Карточка {cad}: кадастровый номер подтверждён.")
                 return info
 
             except Exception as e:
