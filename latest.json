@@ -1,12 +1,12 @@
 {
-  "latest_version": "V1.4",
-  "version_code": 14,
+  "latest_version": "V1.5",
+  "version_code": 15,
   "channel": "stable",
   "file_name": "rosreestr_parser.zip",
-  "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v1.4/rosreestr_parser.zip",
-  "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1.4",
-  "sha256": "792fab4c6dc9c0ba4decd17b5d60ffbd6bf3e1a7236f81c7fdcf02b5b9981741",
+  "download_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/download/v1.5/rosreestr_parser.zip",
+  "release_url": "https://github.com/serbo26-lab/rosreestr-parser/releases/tag/v1.5",
+  "sha256": "83b19039adce4cbc84e76f704230dc4025eb629b3d0cd6f60f9066bb742be7b7",
   "notes": [
-    "При поиске по списку кадастровых номеров теперь заполняются номера квартир, даже если их не было в исходном файле. Номера квартир теперь отображаются и в журнале поиска. Различия в адресах не считаются ошибкой, если кадастровый номер совпадает. При запуске программа сама проверяет наличие обновлений и предлагает установить новую версию, если она доступна."
+    "Исправлен поиск квартир по адресам без точек и запятых. Улучшен выбор кадастрового номера при нескольких совпадениях. Перебор вариантов номера квартиры теперь выключен по умолчанию. Обновлена форма Burmistr до V2. Площадь записывается числом. Улучшено сопоставление со старыми реестрами: конфликтующие доли не переносятся, спорные строки подсвечиваются."
   ]
 }
